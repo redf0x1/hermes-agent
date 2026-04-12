@@ -1807,7 +1807,7 @@ def auxiliary_max_tokens_param(value: int) -> dict:
 # Every auxiliary LLM consumer should use these instead of manually
 # constructing clients and calling .chat.completions.create().
 
-# Client cache: (provider, async_mode, base_url, api_key) -> (client, default_model)
+# Client cache: (provider, model_key, async_mode, base_url, api_key, api_mode, loop_id, runtime_key) -> (client, default_model, loop)
 _client_cache: Dict[tuple, tuple] = {}
 _client_cache_lock = threading.Lock()
 
@@ -1961,7 +1961,8 @@ def _get_cached_client(
             pass
     runtime = _normalize_main_runtime(main_runtime)
     runtime_key = tuple(runtime.get(field, "") for field in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
-    cache_key = (provider, async_mode, base_url or "", api_key or "", api_mode or "", loop_id, runtime_key)
+    model_key = str(model or "").strip()
+    cache_key = (provider, model_key, async_mode, base_url or "", api_key or "", api_mode or "", loop_id, runtime_key)
     with _client_cache_lock:
         if cache_key in _client_cache:
             cached_client, cached_default, cached_loop = _client_cache[cache_key]

@@ -22,12 +22,14 @@ from agent.auxiliary_client import (
     _is_payment_error,
     _try_payment_fallback,
     _resolve_auto,
+    _get_cached_client,
+    _client_cache,
 )
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
-    """Strip provider env vars so each test starts clean."""
+    """Strip provider env vars and reset the auxiliary client cache so each test starts clean."""
     for key in (
         "OPENROUTER_API_KEY", "OPENAI_BASE_URL", "OPENAI_API_KEY",
         "OPENAI_MODEL", "LLM_MODEL", "NOUS_INFERENCE_BASE_URL",
@@ -40,6 +42,60 @@ def _clean_env(monkeypatch):
         "CONTEXT_COMPRESSION_PROVIDER", "CONTEXT_COMPRESSION_MODEL",
     ):
         monkeypatch.delenv(key, raising=False)
+    _client_cache.clear()
+    yield
+    _client_cache.clear()
+
+
+class TestCachedClientCacheKey:
+    def test_get_cached_client_separates_cache_by_model_for_custom_openai_endpoint(self):
+        created = []
+
+        def _fake_resolve(provider, model, async_mode, **kw):
+            client = MagicMock(name=f"client-{model}")
+            client.api_key = kw.get("explicit_api_key", "sk-test")
+            client.base_url = kw.get("explicit_base_url", "https://api.openai.com/v1")
+            created.append((model, client))
+            return client, model or "default-model"
+
+        with patch("agent.auxiliary_client.resolve_provider_client", side_effect=_fake_resolve):
+            client_a1, effective_a1 = _get_cached_client(
+                "custom",
+                "gpt-4o-mini",
+                async_mode=False,
+                base_url="https://api.openai.com/v1",
+                api_key="sk-test",
+            )
+            client_b1, effective_b1 = _get_cached_client(
+                "custom",
+                "gpt-5.3-codex",
+                async_mode=False,
+                base_url="https://api.openai.com/v1",
+                api_key="sk-test",
+            )
+            client_a2, effective_a2 = _get_cached_client(
+                "custom",
+                "gpt-4o-mini",
+                async_mode=False,
+                base_url="https://api.openai.com/v1",
+                api_key="sk-test",
+            )
+            client_b2, effective_b2 = _get_cached_client(
+                "custom",
+                "gpt-5.3-codex",
+                async_mode=False,
+                base_url="https://api.openai.com/v1",
+                api_key="sk-test",
+            )
+
+        assert client_a1 is not client_b1
+        assert client_a1 is client_a2
+        assert client_b1 is client_b2
+        assert effective_a1 == "gpt-4o-mini"
+        assert effective_a2 == "gpt-4o-mini"
+        assert effective_b1 == "gpt-5.3-codex"
+        assert effective_b2 == "gpt-5.3-codex"
+        assert len(created) == 2
 
 
 @pytest.fixture
