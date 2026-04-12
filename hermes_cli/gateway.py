@@ -1363,6 +1363,7 @@ def launchd_start():
         plist_path.parent.mkdir(parents=True, exist_ok=True)
         plist_path.write_text(generate_launchd_plist(), encoding="utf-8")
         subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True, timeout=30)
+        subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
         print("✓ Service started")
         return
 
