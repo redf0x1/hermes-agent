@@ -1354,26 +1354,31 @@ def launchd_uninstall():
 def launchd_start():
     plist_path = get_launchd_plist_path()
     label = get_launchd_label()
+    domain = _launchd_domain()
+    target = f"{domain}/{label}"
 
     # Self-heal if the plist is missing entirely (e.g., manual cleanup, failed upgrade)
     if not plist_path.exists():
         print("↻ launchd plist missing; regenerating service definition")
         plist_path.parent.mkdir(parents=True, exist_ok=True)
         plist_path.write_text(generate_launchd_plist(), encoding="utf-8")
-        subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
-        subprocess.run(["launchctl", "kickstart", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
+        subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True, timeout=30)
         print("✓ Service started")
         return
 
     refresh_launchd_plist_if_needed()
     try:
-        subprocess.run(["launchctl", "kickstart", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
+        subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
     except subprocess.CalledProcessError as e:
         if e.returncode not in (3, 113):
             raise
         print("↻ launchd job was unloaded; reloading service definition")
-        subprocess.run(["launchctl", "bootstrap", _launchd_domain(), str(plist_path)], check=True, timeout=30)
-        subprocess.run(["launchctl", "kickstart", f"{_launchd_domain()}/{label}"], check=True, timeout=30)
+        subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True, timeout=30)
+        subprocess.run(["launchctl", "kickstart", target], check=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        print("↻ launchctl kickstart timed out; booting the service out and reloading it")
+        subprocess.run(["launchctl", "bootout", target], check=False, timeout=90)
+        subprocess.run(["launchctl", "bootstrap", domain, str(plist_path)], check=True, timeout=30)
     print("✓ Service started")
 
 def launchd_stop():
