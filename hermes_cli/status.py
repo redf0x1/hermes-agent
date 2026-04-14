@@ -141,9 +141,19 @@ def show_status(args):
     image_generation_model = ""
     image_generation_provider_error = ""
     if isinstance(image_generation_cfg, dict):
-        image_generation_provider = str(image_generation_cfg.get("provider") or "").strip().lower()
         image_generation_model = str(image_generation_cfg.get("model") or "").strip()
-        image_generation_provider_error = str(image_generation_cfg.get("provider_error") or "").strip()
+        raw_image_generation_provider = str(image_generation_cfg.get("provider") or "").strip()
+        try:
+            from tools.image_generation_tool import _normalize_image_provider
+            image_generation_provider = _normalize_image_provider(raw_image_generation_provider)
+        except Exception:
+            image_generation_provider = raw_image_generation_provider.lower()
+        try:
+            from tools.image_generation_tool import _load_image_generation_config
+            normalized_image_cfg = _load_image_generation_config()
+            image_generation_provider_error = str(normalized_image_cfg.get("provider_error") or "").strip()
+        except Exception as exc:
+            image_generation_provider_error = str(exc)
     
     for name, env_var in keys.items():
         value = get_env_value(env_var) or ""
@@ -163,11 +173,12 @@ def show_status(args):
                 ready = bool(check_fal_api_key())
             except Exception:
                 ready = bool(get_env_value("FAL_KEY"))
-        label = image_generation_provider
+        label = image_generation_provider or str(image_generation_cfg.get("provider") or "").strip().lower()
         if image_generation_model:
             label = f"{label} ({image_generation_model})"
         if image_generation_provider_error:
             label = f"{label} — invalid config: {image_generation_provider_error}"
+            ready = False
         print(f"  {'Image Gen':<12}  {check_mark(ready)} {label}")
 
     from hermes_cli.auth import get_anthropic_key

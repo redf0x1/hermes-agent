@@ -452,3 +452,18 @@ def test_check_image_generation_requirements_accepts_openrouter_backend(tmp_path
     from tools import image_generation_tool
 
     assert image_generation_tool.check_image_generation_requirements() is True
+
+
+def test_check_image_generation_requirements_rejects_invalid_provider_config(tmp_path, monkeypatch):
+    (tmp_path / "config.yaml").write_text(
+        yaml.safe_dump({"image_generation": {"provider": "OpenRuter"}}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("FAL_KEY", "fal-key")
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    from tools import image_generation_tool
+
+    assert image_generation_tool.check_image_generation_requirements() is False

@@ -96,11 +96,57 @@ def test_show_status_fal_backend_uses_runtime_readiness(monkeypatch, capsys, tmp
         raising=False,
     )
     monkeypatch.setattr("hermes_cli.status.check_fal_api_key", lambda: True, raising=False)
+    monkeypatch.setattr(
+        "tools.image_generation_tool._load_image_generation_config",
+        lambda: {
+            "provider": "fal",
+            "model": "fal-ai/flux-2-pro",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+            "provider_error": "",
+        },
+        raising=False,
+    )
 
     show_status(SimpleNamespace(all=False, deep=False))
 
     output = capsys.readouterr().out
     assert "✓ fal (fal-ai/flux-2-pro)" in output
+
+
+def test_show_status_surfaces_invalid_image_generation_provider(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "hermes_cli.status.load_config",
+        lambda: {
+            "model": {"default": "anthropic/claude-sonnet-4", "provider": "anthropic"},
+            "image_generation": {
+                "provider": "OpenRuter",
+                "model": "google/gemini-2.5-flash-image",
+            },
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "tools.image_generation_tool._load_image_generation_config",
+        lambda: {
+            "provider": "fal",
+            "model": "google/gemini-2.5-flash-image",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+            "provider_error": "Unsupported image_generation.provider 'OpenRuter'. Supported providers: ['fal', 'openrouter']",
+        },
+        raising=False,
+    )
+
+    show_status(SimpleNamespace(all=False, deep=False))
+
+    output = capsys.readouterr().out
+    assert "Image Gen" in output
+    assert "invalid config" in output
+    assert "OpenRuter" in output
 
 
 def test_show_status_termux_gateway_section_skips_systemctl(monkeypatch, capsys, tmp_path):

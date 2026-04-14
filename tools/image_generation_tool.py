@@ -955,6 +955,10 @@ def check_image_generation_requirements() -> bool:
         bool: True if requirements are met, False otherwise
     """
     image_config = _load_image_generation_config()
+    provider_error = str(image_config.get("provider_error") or "").strip()
+    if provider_error:
+        return False
+
     provider = _normalize_image_provider(image_config.get("provider"))
 
     if provider == IMAGE_PROVIDER_OPENROUTER:
