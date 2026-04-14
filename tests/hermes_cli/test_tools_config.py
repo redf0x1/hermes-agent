@@ -219,6 +219,20 @@ def test_is_provider_active_for_image_gen_openrouter():
     assert _is_provider_active(provider, config) is True
 
 
+def test_is_provider_active_for_image_gen_openrouter_accepts_other_supported_model():
+    provider = TOOL_CATEGORIES["image_gen"]["providers"][2]
+    from hermes_cli.tools_config import _is_provider_active
+
+    config = {
+        "image_generation": {
+            "provider": "openrouter",
+            "model": "google/gemini-2.5-flash-image",
+        }
+    }
+
+    assert _is_provider_active(provider, config) is True
+
+
 def test_is_provider_active_for_image_gen_fal():
     provider = TOOL_CATEGORIES["image_gen"]["providers"][1]
     from hermes_cli.tools_config import _is_provider_active

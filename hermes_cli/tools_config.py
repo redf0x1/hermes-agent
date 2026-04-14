@@ -944,6 +944,8 @@ def _is_provider_active(provider: dict, config: dict) -> bool:
         current_provider = str(image_cfg.get("provider") or "fal").strip().lower()
         if current_provider != provider["image_generation_provider"]:
             return False
+        if current_provider == "openrouter":
+            return True
         model = str(image_cfg.get("model") or "").strip()
         expected_model = str(provider.get("image_generation_model") or "").strip()
         return not expected_model or not model or model == expected_model

@@ -18,6 +18,7 @@ from hermes_cli.models import provider_label
 from hermes_cli.nous_subscription import get_nous_subscription_features
 from hermes_cli.runtime_provider import resolve_requested_provider
 from hermes_constants import OPENROUTER_MODELS_URL
+from tools.image_generation_tool import check_fal_api_key
 from tools.tool_backend_helpers import managed_nous_tools_enabled
 
 def check_mark(ok: bool) -> str:
@@ -138,9 +139,11 @@ def show_status(args):
     image_generation_cfg = config.get("image_generation", {}) if isinstance(config, dict) else {}
     image_generation_provider = ""
     image_generation_model = ""
+    image_generation_provider_error = ""
     if isinstance(image_generation_cfg, dict):
-        image_generation_provider = str(image_generation_cfg.get("provider") or "").strip()
+        image_generation_provider = str(image_generation_cfg.get("provider") or "").strip().lower()
         image_generation_model = str(image_generation_cfg.get("model") or "").strip()
+        image_generation_provider_error = str(image_generation_cfg.get("provider_error") or "").strip()
     
     for name, env_var in keys.items():
         value = get_env_value(env_var) or ""
@@ -156,10 +159,15 @@ def show_status(args):
                 or get_env_value("OPENROUTER_API_KEY")
             )
         elif image_generation_provider == "fal":
-            ready = bool(get_env_value("FAL_KEY"))
+            try:
+                ready = bool(check_fal_api_key())
+            except Exception:
+                ready = bool(get_env_value("FAL_KEY"))
         label = image_generation_provider
         if image_generation_model:
             label = f"{label} ({image_generation_model})"
+        if image_generation_provider_error:
+            label = f"{label} — invalid config: {image_generation_provider_error}"
         print(f"  {'Image Gen':<12}  {check_mark(ready)} {label}")
 
     from hermes_cli.auth import get_anthropic_key

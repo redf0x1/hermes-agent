@@ -33,6 +33,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import datetime
 import threading
 import uuid
@@ -58,6 +59,7 @@ DEFAULT_OUTPUT_FORMAT = "png"
 
 IMAGE_PROVIDER_FAL = "fal"
 IMAGE_PROVIDER_OPENROUTER = "openrouter"
+_SUPPORTED_IMAGE_PROVIDERS = frozenset({IMAGE_PROVIDER_FAL, IMAGE_PROVIDER_OPENROUTER})
 
 SUPPORTED_OPENROUTER_IMAGE_MODELS = frozenset({
     "google/gemini-2.5-flash-image",
@@ -247,9 +249,14 @@ def _submit_fal_request(model: str, arguments: Dict[str, Any]):
 
 def _normalize_image_provider(provider: Any) -> str:
     normalized = str(provider or "").strip().lower()
-    if normalized == IMAGE_PROVIDER_OPENROUTER:
-        return IMAGE_PROVIDER_OPENROUTER
-    return IMAGE_PROVIDER_FAL
+    if not normalized:
+        return IMAGE_PROVIDER_FAL
+    if normalized in _SUPPORTED_IMAGE_PROVIDERS:
+        return normalized
+    raise ValueError(
+        f"Unsupported image_generation.provider '{provider}'. "
+        f"Supported providers: {sorted(_SUPPORTED_IMAGE_PROVIDERS)}"
+    )
 
 
 def _load_image_generation_config() -> Dict[str, Any]:
@@ -259,6 +266,7 @@ def _load_image_generation_config() -> Dict[str, Any]:
         "base_url": "",
         "api_key": "",
         "timeout": 120,
+        "provider_error": "",
     }
     try:
         from hermes_cli.config import load_config
@@ -284,9 +292,10 @@ def _load_image_generation_config() -> Dict[str, Any]:
             "base_url": str(loaded.get("base_url") or "").strip(),
             "api_key": str(loaded.get("api_key") or "").strip(),
             "timeout": timeout,
+            "provider_error": "",
         })
-    except Exception:
-        pass
+    except Exception as exc:
+        config["provider_error"] = str(exc)
     return config
 
 
@@ -465,6 +474,34 @@ def _extract_image_url_from_entry(entry: Any) -> str:
     return ""
 
 
+def _extract_image_refs_from_content_string(content: str) -> list[str]:
+    text = str(content or "").strip()
+    if not text:
+        return []
+
+    refs: list[str] = []
+
+    for match in re.finditer(r"data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+", text):
+        refs.append(match.group(0))
+
+    markdown_pattern = re.compile(r"!\[[^\]]*\]\((https?://[^)\s]+|data:image/[^)\s]+)\)")
+    for match in markdown_pattern.finditer(text):
+        refs.append(match.group(1))
+
+    url_pattern = re.compile(r"https?://\S+")
+    for match in url_pattern.finditer(text):
+        candidate = match.group(0).rstrip(').,]')
+        refs.append(candidate)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for ref in refs:
+        if ref and ref not in seen:
+            seen.add(ref)
+            deduped.append(ref)
+    return deduped
+
+
 def _extract_openrouter_image_references(payload: Dict[str, Any]) -> list[str]:
     image_refs: list[str] = []
 
@@ -488,6 +525,8 @@ def _extract_openrouter_image_references(payload: Dict[str, Any]) -> list[str]:
                 image_ref = _extract_image_url_from_entry(entry)
                 if image_ref:
                     image_refs.append(image_ref)
+        elif isinstance(content, str):
+            image_refs.extend(_extract_image_refs_from_content_string(content))
 
     data = payload.get("data")
     if isinstance(data, list):
@@ -496,7 +535,13 @@ def _extract_openrouter_image_references(payload: Dict[str, Any]) -> list[str]:
             if image_ref:
                 image_refs.append(image_ref)
 
-    return image_refs
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for ref in image_refs:
+        if ref and ref not in seen:
+            seen.add(ref)
+            deduped.append(ref)
+    return deduped
 
 
 def _generate_via_openrouter(
@@ -718,7 +763,8 @@ def image_generate_tool(
              }
     """
     image_config = _load_image_generation_config()
-    provider = _normalize_image_provider(image_config.get("provider"))
+    provider_error = str(image_config.get("provider_error") or "").strip()
+    provider = _normalize_image_provider(image_config.get("provider")) if not provider_error else IMAGE_PROVIDER_FAL
 
     # Validate and map aspect_ratio to actual image_size
     aspect_ratio_lower = aspect_ratio.lower().strip() if aspect_ratio else DEFAULT_ASPECT_RATIO
@@ -753,6 +799,9 @@ def image_generate_tool(
         # Validate prompt
         if not prompt or not isinstance(prompt, str) or len(prompt.strip()) == 0:
             raise ValueError("Prompt is required and must be a non-empty string")
+
+        if provider_error:
+            raise ValueError(provider_error)
 
         if provider == IMAGE_PROVIDER_OPENROUTER:
             return _generate_via_openrouter(

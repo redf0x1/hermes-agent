@@ -51,12 +51,56 @@ def test_show_status_marks_image_generation_unready_without_active_backend_key(m
         },
         raising=False,
     )
+    monkeypatch.setattr("hermes_cli.status.check_fal_api_key", lambda: False, raising=False)
 
     show_status(SimpleNamespace(all=False, deep=False))
 
     output = capsys.readouterr().out
     assert "Image Gen" in output
     assert "✗ fal (fal-ai/flux-2-pro)" in output
+
+
+def test_show_status_normalizes_image_generation_provider_case(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    monkeypatch.setattr(
+        "hermes_cli.status.load_config",
+        lambda: {
+            "model": {"default": "anthropic/claude-sonnet-4", "provider": "anthropic"},
+            "image_generation": {
+                "provider": "OpenRouter",
+                "model": "google/gemini-3.1-flash-image-preview",
+            },
+        },
+        raising=False,
+    )
+
+    show_status(SimpleNamespace(all=False, deep=False))
+
+    output = capsys.readouterr().out
+    assert "✓ openrouter (google/gemini-3.1-flash-image-preview)" in output
+
+
+def test_show_status_fal_backend_uses_runtime_readiness(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("FAL_KEY", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.status.load_config",
+        lambda: {
+            "model": {"default": "anthropic/claude-sonnet-4", "provider": "anthropic"},
+            "image_generation": {
+                "provider": "fal",
+                "model": "fal-ai/flux-2-pro",
+            },
+        },
+        raising=False,
+    )
+    monkeypatch.setattr("hermes_cli.status.check_fal_api_key", lambda: True, raising=False)
+
+    show_status(SimpleNamespace(all=False, deep=False))
+
+    output = capsys.readouterr().out
+    assert "✓ fal (fal-ai/flux-2-pro)" in output
 
 
 def test_show_status_termux_gateway_section_skips_systemctl(monkeypatch, capsys, tmp_path):
