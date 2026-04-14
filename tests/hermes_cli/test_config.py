@@ -459,7 +459,7 @@ class TestCustomProviderCompatibility:
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
-        assert raw["_config_version"] == 17
+        assert raw["_config_version"] == 18
         assert raw["providers"]["openai-direct"] == {
             "api": "https://api.openai.com/v1",
             "api_key": "test-key",
@@ -477,7 +477,7 @@ class TestCustomProviderCompatibility:
         config_path.write_text(
             yaml.safe_dump(
                 {
-                    "_config_version": 17,
+                    "_config_version": 18,
                     "providers": {
                         "openai-direct": {
                             "api": "https://api.openai.com/v1",
@@ -506,7 +506,7 @@ class TestCustomProviderCompatibility:
         config_path.write_text(
             yaml.safe_dump(
                 {
-                    "_config_version": 17,
+                    "_config_version": 18,
                     "providers": {
                         "my-provider": {
                             "name": "My Provider",
@@ -537,7 +537,7 @@ class TestCustomProviderCompatibility:
         config_path.write_text(
             yaml.safe_dump(
                 {
-                    "_config_version": 17,
+                    "_config_version": 18,
                     "custom_providers": [
                         {
                             "name": "OpenAI Direct",
@@ -570,7 +570,7 @@ class TestCustomProviderCompatibility:
         config_path.write_text(
             yaml.safe_dump(
                 {
-                    "_config_version": 17,
+                    "_config_version": 18,
                     "custom_providers": [
                         {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "qwen3-coder"},
                         {"name": "Ollama Cloud", "base_url": "https://ollama.com/v1", "model": "glm-5.1"},
@@ -587,6 +587,58 @@ class TestCustomProviderCompatibility:
         assert len(compatible) == 3
         models = [e.get("model") for e in compatible]
         assert models == ["qwen3-coder", "glm-5.1", "kimi-k2.5"]
+
+
+class TestImageGenerationConfig:
+    def test_default_config_contains_image_generation_backend(self):
+        assert DEFAULT_CONFIG["image_generation"] == {
+            "provider": "fal",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+        }
+
+    def test_load_config_preserves_image_generation_override(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "image_generation": {
+                        "provider": "openrouter",
+                        "model": "google/gemini-2.5-flash-image",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            config = load_config()
+
+        assert config["image_generation"]["provider"] == "openrouter"
+        assert config["image_generation"]["model"] == "google/gemini-2.5-flash-image"
+        assert config["image_generation"]["timeout"] == 120
+
+    def test_migrate_to_v18_adds_image_generation_defaults(self, tmp_path):
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump({"_config_version": 17, "model": {"provider": "openrouter", "default": "openai/gpt-5.4"}}),
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            migrate_config(interactive=False, quiet=True)
+            raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+
+        assert raw["_config_version"] == 18
+        assert raw["image_generation"] == {
+            "provider": "fal",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+        }
 
 
 class TestInterimAssistantMessageConfig:
@@ -606,6 +658,6 @@ class TestInterimAssistantMessageConfig:
             migrate_config(interactive=False, quiet=True)
             raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
 
-        assert raw["_config_version"] == 17
+        assert raw["_config_version"] == 18
         assert raw["display"]["tool_progress"] == "off"
         assert raw["display"]["interim_assistant_messages"] is True

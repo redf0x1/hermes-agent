@@ -23,6 +23,51 @@ def test_get_nous_subscription_features_recognizes_direct_exa_backend(monkeypatc
     assert features.web.current_provider == "exa"
 
 
+def test_get_nous_subscription_features_recognizes_openrouter_image_generation(monkeypatch):
+    env = {"OPENROUTER_API_KEY": "or-key"}
+
+    monkeypatch.setattr(ns, "get_env_value", lambda name: env.get(name, ""))
+    monkeypatch.setattr(ns, "get_nous_auth_status", lambda: {"logged_in": True})
+    monkeypatch.setattr(ns, "managed_nous_tools_enabled", lambda: True)
+    monkeypatch.setattr(ns, "_toolset_enabled", lambda config, key: key == "image_gen")
+    monkeypatch.setattr(ns, "_has_agent_browser", lambda: False)
+    monkeypatch.setattr(ns, "resolve_openai_audio_api_key", lambda: "")
+    monkeypatch.setattr(ns, "has_direct_modal_credentials", lambda: False)
+    monkeypatch.setattr(ns, "is_managed_tool_gateway_ready", lambda vendor: vendor == "fal-queue")
+
+    features = ns.get_nous_subscription_features(
+        {"image_generation": {"provider": "openrouter", "model": "google/gemini-3.1-flash-image-preview"}}
+    )
+
+    assert features.image_gen.available is True
+    assert features.image_gen.active is True
+    assert features.image_gen.managed_by_nous is False
+    assert features.image_gen.direct_override is True
+    assert features.image_gen.current_provider == "google/gemini-3.1-flash-image-preview"
+    assert features.image_gen.explicit_configured is True
+
+
+def test_get_nous_subscription_features_does_not_mark_openrouter_image_generation_as_managed(monkeypatch):
+    env = {"OPENROUTER_API_KEY": "or-key"}
+
+    monkeypatch.setattr(ns, "get_env_value", lambda name: env.get(name, ""))
+    monkeypatch.setattr(ns, "get_nous_auth_status", lambda: {"logged_in": True})
+    monkeypatch.setattr(ns, "managed_nous_tools_enabled", lambda: True)
+    monkeypatch.setattr(ns, "_toolset_enabled", lambda config, key: key == "image_gen")
+    monkeypatch.setattr(ns, "_has_agent_browser", lambda: False)
+    monkeypatch.setattr(ns, "resolve_openai_audio_api_key", lambda: "")
+    monkeypatch.setattr(ns, "has_direct_modal_credentials", lambda: False)
+    monkeypatch.setattr(ns, "is_managed_tool_gateway_ready", lambda vendor: vendor == "fal-queue")
+
+    features = ns.get_nous_subscription_features(
+        {"image_generation": {"provider": "openrouter", "model": "openai/gpt-5-image-mini"}}
+    )
+
+    assert features.image_gen.managed_by_nous is False
+    assert features.image_gen.current_provider == "openai/gpt-5-image-mini"
+
+
+
 def test_get_nous_subscription_features_prefers_managed_modal_in_auto_mode(monkeypatch):
     monkeypatch.setenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", "1")
     monkeypatch.setattr(ns, "get_env_value", lambda name: "")

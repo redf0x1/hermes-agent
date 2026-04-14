@@ -228,6 +228,7 @@ TOOL_CATEGORIES = {
                 "requires_nous_auth": True,
                 "managed_nous_feature": "image_gen",
                 "override_env_vars": ["FAL_KEY"],
+                "image_generation_provider": "fal",
             },
             {
                 "name": "FAL.ai",
@@ -235,6 +236,17 @@ TOOL_CATEGORIES = {
                 "env_vars": [
                     {"key": "FAL_KEY", "prompt": "FAL API key", "url": "https://fal.ai/dashboard/keys"},
                 ],
+                "image_generation_provider": "fal",
+                "image_generation_model": "fal-ai/flux-2-pro",
+            },
+            {
+                "name": "OpenRouter",
+                "tag": "OpenRouter image generation (Gemini/GPT Image allowlist)",
+                "env_vars": [
+                    {"key": "OPENROUTER_API_KEY", "prompt": "OpenRouter API key", "url": "https://openrouter.ai/keys"},
+                ],
+                "image_generation_provider": "openrouter",
+                "image_generation_model": "google/gemini-3.1-flash-image-preview",
             },
         ],
     },
@@ -621,11 +633,26 @@ def _toolset_has_keys(ts_key: str, config: dict = None) -> bool:
         except Exception:
             return False
 
-    if ts_key in {"web", "image_gen", "tts", "browser"}:
+    if ts_key in {"web", "tts", "browser"}:
         features = get_nous_subscription_features(config)
         feature = features.features.get(ts_key)
         if feature and (feature.available or feature.managed_by_nous):
             return True
+
+    if ts_key == "image_gen":
+        features = get_nous_subscription_features(config)
+        feature = features.features.get(ts_key)
+        if feature and (feature.available or feature.managed_by_nous):
+            return True
+
+        image_cfg = config.get("image_generation", {})
+        if not isinstance(image_cfg, dict):
+            image_cfg = {}
+        provider = str(image_cfg.get("provider") or "fal").strip().lower()
+        explicit_api_key = str(image_cfg.get("api_key") or "").strip()
+        if provider == "openrouter":
+            return bool(explicit_api_key or get_env_value("OPENROUTER_API_KEY"))
+        return bool(get_env_value("FAL_KEY"))
 
     # Check TOOL_CATEGORIES first (provider-aware)
     cat = TOOL_CATEGORIES.get(ts_key)
@@ -794,6 +821,13 @@ def _toolset_needs_configuration_prompt(ts_key: str, config: dict) -> bool:
         browser_cfg = config.get("browser", {})
         return not isinstance(browser_cfg, dict) or "cloud_provider" not in browser_cfg
     if ts_key == "image_gen":
+        image_cfg = config.get("image_generation", {})
+        if not isinstance(image_cfg, dict):
+            return True
+        provider = str(image_cfg.get("provider") or "").strip().lower()
+        explicit_api_key = str(image_cfg.get("api_key") or "").strip()
+        if provider == "openrouter":
+            return not bool(explicit_api_key or get_env_value("OPENROUTER_API_KEY"))
         return not get_env_value("FAL_KEY")
 
     return not _toolset_has_keys(ts_key, config)
@@ -875,7 +909,13 @@ def _is_provider_active(provider: dict, config: dict) -> bool:
         if feature is None:
             return False
         if managed_feature == "image_gen":
-            return feature.managed_by_nous
+            if provider.get("image_generation_provider") == "fal":
+                image_cfg = config.get("image_generation", {})
+                if isinstance(image_cfg, dict):
+                    current_provider = str(image_cfg.get("provider") or "fal").strip().lower()
+                    if current_provider == "fal":
+                        return feature.managed_by_nous
+            return feature.managed_by_nous and not provider.get("image_generation_provider")
         if provider.get("tts_provider"):
             return (
                 feature.managed_by_nous
@@ -897,6 +937,16 @@ def _is_provider_active(provider: dict, config: dict) -> bool:
     if provider.get("web_backend"):
         current = config.get("web", {}).get("backend")
         return current == provider["web_backend"]
+    if provider.get("image_generation_provider"):
+        image_cfg = config.get("image_generation", {})
+        if not isinstance(image_cfg, dict):
+            return False
+        current_provider = str(image_cfg.get("provider") or "fal").strip().lower()
+        if current_provider != provider["image_generation_provider"]:
+            return False
+        model = str(image_cfg.get("model") or "").strip()
+        expected_model = str(provider.get("image_generation_model") or "").strip()
+        return not expected_model or not model or model == expected_model
     return False
 
 
@@ -941,6 +991,14 @@ def _configure_provider(provider: dict, config: dict):
     if provider.get("web_backend"):
         config.setdefault("web", {})["backend"] = provider["web_backend"]
         _print_success(f"  Web backend set to: {provider['web_backend']}")
+
+    image_generation_provider = provider.get("image_generation_provider")
+    if image_generation_provider:
+        image_cfg = config.setdefault("image_generation", {})
+        image_cfg["provider"] = image_generation_provider
+        if provider.get("image_generation_model"):
+            image_cfg["model"] = provider["image_generation_model"]
+        _print_success(f"  Image generation backend set to: {image_generation_provider}")
 
     if not env_vars:
         if provider.get("post_setup"):
@@ -1150,6 +1208,14 @@ def _reconfigure_provider(provider: dict, config: dict):
     if provider.get("web_backend"):
         config.setdefault("web", {})["backend"] = provider["web_backend"]
         _print_success(f"  Web backend set to: {provider['web_backend']}")
+
+    image_generation_provider = provider.get("image_generation_provider")
+    if image_generation_provider:
+        image_cfg = config.setdefault("image_generation", {})
+        image_cfg["provider"] = image_generation_provider
+        if provider.get("image_generation_model"):
+            image_cfg["model"] = provider["image_generation_model"]
+        _print_success(f"  Image generation backend set to: {image_generation_provider}")
 
     if not env_vars:
         if provider.get("post_setup"):

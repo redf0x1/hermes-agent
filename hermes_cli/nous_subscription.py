@@ -240,11 +240,14 @@ def get_nous_subscription_features(
     modal_tool_enabled = _toolset_enabled(config, "terminal")
 
     web_cfg = config.get("web") if isinstance(config.get("web"), dict) else {}
+    image_cfg = config.get("image_generation") if isinstance(config.get("image_generation"), dict) else {}
     tts_cfg = config.get("tts") if isinstance(config.get("tts"), dict) else {}
     browser_cfg = config.get("browser") if isinstance(config.get("browser"), dict) else {}
     terminal_cfg = config.get("terminal") if isinstance(config.get("terminal"), dict) else {}
 
     web_backend = str(web_cfg.get("backend") or "").strip().lower()
+    image_provider = str(image_cfg.get("provider") or "fal").strip().lower()
+    image_model = str(image_cfg.get("model") or "").strip()
     tts_provider = str(tts_cfg.get("provider") or "edge").strip().lower()
     browser_provider_explicit = "cloud_provider" in browser_cfg
     browser_provider = normalize_browser_cloud_provider(
@@ -262,6 +265,7 @@ def get_nous_subscription_features(
     direct_parallel = bool(get_env_value("PARALLEL_API_KEY"))
     direct_tavily = bool(get_env_value("TAVILY_API_KEY"))
     direct_fal = bool(get_env_value("FAL_KEY"))
+    direct_openrouter_image = bool(str(image_cfg.get("api_key") or "").strip() or get_env_value("OPENROUTER_API_KEY"))
     direct_openai_tts = bool(resolve_openai_audio_api_key())
     direct_elevenlabs = bool(get_env_value("ELEVENLABS_API_KEY"))
     direct_camofox = bool(get_env_value("CAMOFOX_URL"))
@@ -295,9 +299,22 @@ def get_nous_subscription_features(
         managed_web_available or direct_exa or direct_firecrawl or direct_parallel or direct_tavily
     )
 
-    image_managed = image_tool_enabled and managed_image_available and not direct_fal
-    image_active = bool(image_tool_enabled and (image_managed or direct_fal))
-    image_available = bool(managed_image_available or direct_fal)
+    image_managed = bool(
+        image_tool_enabled
+        and image_provider == "fal"
+        and managed_image_available
+        and not direct_fal
+    )
+    if image_provider == "openrouter":
+        image_available = bool(direct_openrouter_image)
+        image_active = bool(image_tool_enabled and direct_openrouter_image)
+        image_current_provider = image_model or "OpenRouter"
+        image_explicit_configured = bool(direct_openrouter_image)
+    else:
+        image_active = bool(image_tool_enabled and (image_managed or direct_fal))
+        image_available = bool(managed_image_available or direct_fal)
+        image_current_provider = "FAL" if direct_fal else ("Nous Subscription" if image_managed else "")
+        image_explicit_configured = direct_fal
 
     tts_current_provider = tts_provider or "edge"
     tts_managed = (
@@ -390,8 +407,8 @@ def get_nous_subscription_features(
             managed_by_nous=image_managed,
             direct_override=image_active and not image_managed,
             toolset_enabled=image_tool_enabled,
-            current_provider="FAL" if direct_fal else ("Nous Subscription" if image_managed else ""),
-            explicit_configured=direct_fal,
+            current_provider=image_current_provider,
+            explicit_configured=image_explicit_configured,
         ),
         "tts": NousFeatureState(
             key="tts",

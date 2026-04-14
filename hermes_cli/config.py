@@ -491,6 +491,13 @@ DEFAULT_CONFIG = {
             "timeout": 30,
         },
     },
+    "image_generation": {
+        "provider": "fal",       # fal | openrouter
+        "model": "",             # empty = provider default backend model
+        "base_url": "",          # optional OpenAI-compatible override for openrouter backend
+        "api_key": "",           # optional explicit API key for base_url/openrouter backend
+        "timeout": 120,
+    },
     
     "display": {
         "compact": False,
@@ -703,7 +710,7 @@ DEFAULT_CONFIG = {
     },
 
     # Config schema version - bump this when adding new required fields
-    "_config_version": 17,
+    "_config_version": 18,
 }
 
 # =============================================================================
@@ -719,7 +726,9 @@ ENV_VARS_BY_VERSION: Dict[int, List[str]] = {
         "SLACK_BOT_TOKEN", "SLACK_APP_TOKEN", "SLACK_ALLOWED_USERS"],
     10: ["TAVILY_API_KEY"],
     11: ["TERMINAL_MODAL_MODE"],
+    18: ["OPENROUTER_API_KEY"],
 }
+
 
 # Required environment variables with metadata for migration prompts.
 # LLM provider is required but handled in the setup wizard's provider
@@ -739,11 +748,11 @@ OPTIONAL_ENV_VARS = {
         "advanced": True,
     },
     "OPENROUTER_API_KEY": {
-        "description": "OpenRouter API key (for vision, web scraping helpers, and MoA)",
+        "description": "OpenRouter API key (for vision, web scraping helpers, MoA, and image generation when image_generation.provider=openrouter)",
         "prompt": "OpenRouter API key",
         "url": "https://openrouter.ai/keys",
         "password": True,
-        "tools": ["vision_analyze", "mixture_of_agents"],
+        "tools": ["vision_analyze", "mixture_of_agents", "image_generate"],
         "category": "provider",
         "advanced": True,
     },
@@ -2214,6 +2223,24 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                         print(f"  ✓ Migrated compression.summary_* → auxiliary.compression: {', '.join(migrated_keys)}")
                     else:
                         print("  ✓ Removed unused compression.summary_* keys")
+
+    # ── Version 17 → 18: add image_generation backend config ──
+    if current_ver < 18:
+        config = read_raw_config()
+        image_generation = config.get("image_generation")
+        if not isinstance(image_generation, dict):
+            image_generation = {}
+        changed = False
+        for key, default in DEFAULT_CONFIG.get("image_generation", {}).items():
+            if key not in image_generation:
+                image_generation[key] = default
+                changed = True
+        if changed:
+            config["image_generation"] = image_generation
+            results["config_added"].append("image_generation (default backend config)")
+            save_config(config)
+            if not quiet:
+                print("  ✓ Added image_generation backend config")
 
     if current_ver < latest_ver and not quiet:
         print(f"Config version: {current_ver} → {latest_ver}")

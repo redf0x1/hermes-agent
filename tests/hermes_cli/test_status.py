@@ -5,13 +5,58 @@ from hermes_cli.status import show_status
 
 def test_show_status_includes_tavily_key(monkeypatch, capsys, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("TAVILY_API_KEY", "tvly-1234567890abcdef")
+    monkeypatch.setenv("TAVILY_API_KEY", "tvly-1...cdef")
 
     show_status(SimpleNamespace(all=False, deep=False))
 
     output = capsys.readouterr().out
     assert "Tavily" in output
     assert "tvly...cdef" in output
+
+
+def test_show_status_includes_image_generation_backend(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    monkeypatch.setattr(
+        "hermes_cli.status.load_config",
+        lambda: {
+            "model": {"default": "anthropic/claude-sonnet-4", "provider": "anthropic"},
+            "image_generation": {
+                "provider": "openrouter",
+                "model": "google/gemini-3.1-flash-image-preview",
+            },
+        },
+        raising=False,
+    )
+
+    show_status(SimpleNamespace(all=False, deep=False))
+
+    output = capsys.readouterr().out
+    assert "Image Gen" in output
+    assert "openrouter (google/gemini-3.1-flash-image-preview)" in output
+
+
+def test_show_status_marks_image_generation_unready_without_active_backend_key(monkeypatch, capsys, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    monkeypatch.delenv("FAL_KEY", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.status.load_config",
+        lambda: {
+            "model": {"default": "anthropic/claude-sonnet-4", "provider": "anthropic"},
+            "image_generation": {
+                "provider": "fal",
+                "model": "fal-ai/flux-2-pro",
+            },
+        },
+        raising=False,
+    )
+
+    show_status(SimpleNamespace(all=False, deep=False))
+
+    output = capsys.readouterr().out
+    assert "Image Gen" in output
+    assert "✗ fal (fal-ai/flux-2-pro)" in output
 
 
 def test_show_status_termux_gateway_section_skips_systemctl(monkeypatch, capsys, tmp_path):

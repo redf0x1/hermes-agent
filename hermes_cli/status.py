@@ -134,12 +134,33 @@ def show_status(args):
         "ElevenLabs": "ELEVENLABS_API_KEY",
         "GitHub": "GITHUB_TOKEN",
     }
+
+    image_generation_cfg = config.get("image_generation", {}) if isinstance(config, dict) else {}
+    image_generation_provider = ""
+    image_generation_model = ""
+    if isinstance(image_generation_cfg, dict):
+        image_generation_provider = str(image_generation_cfg.get("provider") or "").strip()
+        image_generation_model = str(image_generation_cfg.get("model") or "").strip()
     
     for name, env_var in keys.items():
         value = get_env_value(env_var) or ""
         has_key = bool(value)
         display = redact_key(value) if not show_all else value
         print(f"  {name:<12}  {check_mark(has_key)} {display}")
+
+    if image_generation_provider:
+        ready = False
+        if image_generation_provider == "openrouter":
+            ready = bool(
+                str(image_generation_cfg.get("api_key") or "").strip()
+                or get_env_value("OPENROUTER_API_KEY")
+            )
+        elif image_generation_provider == "fal":
+            ready = bool(get_env_value("FAL_KEY"))
+        label = image_generation_provider
+        if image_generation_model:
+            label = f"{label} ({image_generation_model})"
+        print(f"  {'Image Gen':<12}  {check_mark(ready)} {label}")
 
     from hermes_cli.auth import get_anthropic_key
     anthropic_value = get_anthropic_key()

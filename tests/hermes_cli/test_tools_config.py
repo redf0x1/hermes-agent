@@ -114,7 +114,7 @@ def test_get_platform_tools_no_mcp_sentinel_does_not_affect_other_platforms():
 def test_toolset_has_keys_for_vision_accepts_codex_auth(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / "auth.json").write_text(
-        '{"active_provider":"openai-codex","providers":{"openai-codex":{"tokens":{"access_token": "codex-...oken","refresh_token": "codex-...oken"}}}}'
+        '{"active_provider":"openai-codex","providers":{"openai-codex":{"tokens":{"access_token": "***","refresh_token": "***"}}}}'
     )
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
@@ -126,6 +126,125 @@ def test_toolset_has_keys_for_vision_accepts_codex_auth(tmp_path, monkeypatch):
     )
 
     assert _toolset_has_keys("vision") is True
+
+
+def test_toolset_has_keys_for_image_gen_accepts_openrouter_provider(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    monkeypatch.delenv("FAL_KEY", raising=False)
+
+    config = {
+        "image_generation": {
+            "provider": "openrouter",
+            "model": "google/gemini-3.1-flash-image-preview",
+        }
+    }
+
+    assert _toolset_has_keys("image_gen", config) is True
+
+
+def test_toolset_has_keys_for_image_gen_accepts_config_stored_openrouter_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("FAL_KEY", raising=False)
+
+    config = {
+        "image_generation": {
+            "provider": "openrouter",
+            "api_key": "config-only-openrouter-key",
+        }
+    }
+
+    assert _toolset_has_keys("image_gen", config) is True
+
+
+def test_toolset_has_keys_for_image_gen_rejects_wrong_provider_key(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    monkeypatch.delenv("FAL_KEY", raising=False)
+
+    config = {
+        "image_generation": {
+            "provider": "fal",
+            "model": "fal-ai/flux-2-pro",
+        }
+    }
+
+    assert _toolset_has_keys("image_gen", config) is False
+
+
+def test_toolset_needs_configuration_prompt_for_image_gen_checks_openrouter_key(monkeypatch):
+    from hermes_cli.tools_config import _toolset_needs_configuration_prompt
+
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("FAL_KEY", raising=False)
+
+    assert _toolset_needs_configuration_prompt("image_gen", {"image_generation": {"provider": "openrouter"}}) is True
+    assert _toolset_needs_configuration_prompt(
+        "image_gen",
+        {"image_generation": {"provider": "openrouter", "api_key": "config-key"}},
+    ) is False
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
+    assert _toolset_needs_configuration_prompt("image_gen", {"image_generation": {"provider": "openrouter"}}) is False
+
+
+def test_configure_provider_sets_image_generation_backend(monkeypatch):
+    provider = TOOL_CATEGORIES["image_gen"]["providers"][2]
+    config = {"image_generation": {}}
+
+    monkeypatch.setattr("hermes_cli.tools_config.get_env_value", lambda key: "or-key" if key == "OPENROUTER_API_KEY" else "")
+    monkeypatch.setattr("hermes_cli.tools_config.save_env_value", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.tools_config._run_post_setup", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.tools_config._print_success", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.tools_config._print_info", lambda *args, **kwargs: None)
+    monkeypatch.setattr("hermes_cli.tools_config._print_warning", lambda *args, **kwargs: None)
+
+    _configure_provider(provider, config)
+
+    assert config["image_generation"]["provider"] == "openrouter"
+    assert config["image_generation"]["model"] == "google/gemini-3.1-flash-image-preview"
+
+
+def test_is_provider_active_for_image_gen_openrouter():
+    provider = TOOL_CATEGORIES["image_gen"]["providers"][2]
+    from hermes_cli.tools_config import _is_provider_active
+
+    config = {
+        "image_generation": {
+            "provider": "openrouter",
+            "model": "google/gemini-3.1-flash-image-preview",
+        }
+    }
+
+    assert _is_provider_active(provider, config) is True
+
+
+def test_is_provider_active_for_image_gen_fal():
+    provider = TOOL_CATEGORIES["image_gen"]["providers"][1]
+    from hermes_cli.tools_config import _is_provider_active
+
+    config = {
+        "image_generation": {
+            "provider": "fal",
+            "model": "fal-ai/flux-2-pro",
+        }
+    }
+
+    assert _is_provider_active(provider, config) is True
+
+
+def test_is_provider_active_for_image_gen_rejects_different_provider():
+    provider = TOOL_CATEGORIES["image_gen"]["providers"][2]
+    from hermes_cli.tools_config import _is_provider_active
+
+    config = {
+        "image_generation": {
+            "provider": "fal",
+            "model": "fal-ai/flux-2-pro",
+        }
+    }
+
+    assert _is_provider_active(provider, config) is False
 
 
 def test_save_platform_tools_preserves_mcp_server_names():
