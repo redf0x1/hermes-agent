@@ -8,6 +8,13 @@ import time
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _disable_host_codex_cli_import(monkeypatch):
+    """Keep host ~/.codex/auth.json from leaking into unit tests."""
+    monkeypatch.setattr("agent.credential_pool._import_codex_cli_tokens", lambda: None)
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+
 def _write_auth_store(tmp_path, payload: dict) -> None:
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
@@ -330,6 +337,12 @@ def test_mark_exhausted_and_rotate_persists_status(tmp_path, monkeypatch):
 
 def test_try_refresh_current_updates_only_current_entry(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    primary_access = "access-current-abcdefghijklmnopqrstuvwxyz0123456789"
+    primary_refresh = "refresh-current-abcdefghijklmnopqrstuvwxyz0123456789"
+    secondary_access = "access-other-abcdefghijklmnopqrstuvwxyz0123456789"
+    secondary_refresh = "refresh-other-abcdefghijklmnopqrstuvwxyz0123456789"
+    refreshed_access = "access-new-abcdefghijklmnopqrstuvwxyz0123456789"
+    refreshed_refresh = "refresh-new-abcdefghijklmnopqrstuvwxyz0123456789"
     _write_auth_store(
         tmp_path,
         {
@@ -341,9 +354,9 @@ def test_try_refresh_current_updates_only_current_entry(tmp_path, monkeypatch):
                         "label": "primary",
                         "auth_type": "oauth",
                         "priority": 0,
-                        "source": "device_code",
-                        "access_token": "access-old",
-                        "refresh_token": "refresh-old",
+                        "source": "manual:device_code",
+                        "access_token": primary_access,
+                        "refresh_token": primary_refresh,
                         "base_url": "https://chatgpt.com/backend-api/codex",
                     },
                     {
@@ -351,9 +364,9 @@ def test_try_refresh_current_updates_only_current_entry(tmp_path, monkeypatch):
                         "label": "secondary",
                         "auth_type": "oauth",
                         "priority": 1,
-                        "source": "device_code",
-                        "access_token": "access-other",
-                        "refresh_token": "refresh-other",
+                        "source": "manual:device_code",
+                        "access_token": secondary_access,
+                        "refresh_token": secondary_refresh,
                         "base_url": "https://chatgpt.com/backend-api/codex",
                     },
                 ]
@@ -366,8 +379,8 @@ def test_try_refresh_current_updates_only_current_entry(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.auth.refresh_codex_oauth_pure",
         lambda access_token, refresh_token, timeout_seconds=20.0: {
-            "access_token": "access-new",
-            "refresh_token": "refresh-new",
+            "access_token": refreshed_access,
+            "refresh_token": refreshed_refresh,
         },
     )
 
@@ -378,14 +391,15 @@ def test_try_refresh_current_updates_only_current_entry(tmp_path, monkeypatch):
     refreshed = pool.try_refresh_current()
 
     assert refreshed is not None
-    assert refreshed.access_token == "access-new"
+    assert refreshed.access_token == refreshed_access
+    assert refreshed.refresh_token == refreshed_refresh
 
     auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
     primary, secondary = auth_payload["credential_pool"]["openai-codex"]
-    assert primary["access_token"] == "access-new"
-    assert primary["refresh_token"] == "refresh-new"
-    assert secondary["access_token"] == "access-other"
-    assert secondary["refresh_token"] == "refresh-other"
+    assert primary["access_token"] == refreshed_access
+    assert primary["refresh_token"] == refreshed_refresh
+    assert secondary["access_token"] == secondary_access
+    assert secondary["refresh_token"] == secondary_refresh
 
 
 def test_load_pool_ignores_unusable_codex_singleton_tokens(tmp_path, monkeypatch):

@@ -151,11 +151,13 @@ def test_save_codex_tokens_roundtrip(tmp_path, monkeypatch):
     (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    _save_codex_tokens({"access_token": "hermes-at-abcdefghijklmnopqrstuvwxyz0123456789", "refresh_token": "hermes-rt-abcdefghijklmnopqrstuvwxyz0123456789"})
+    access_token = "hermes-at-abcdefghijklmnopqrstuvwxyz0123456789"
+    refresh_token = "hermes-rt-abcdefghijklmnopqrstuvwxyz0123456789"
+    _save_codex_tokens({"access_token": access_token, "refresh_token": refresh_token})
     data = _read_codex_tokens()
 
-    assert data["tokens"]["access_token"] == "at123-abcdefghijklmnopqrstuvwxyz0123456789"
-    assert data["tokens"]["refresh_token"] == "rt456-abcdefghijklmnopqrstuvwxyz0123456789"
+    assert data["tokens"]["access_token"] == access_token
+    assert data["tokens"]["refresh_token"] == refresh_token
 
 
 def test_import_codex_cli_tokens(tmp_path, monkeypatch):

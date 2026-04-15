@@ -33,6 +33,7 @@ def _clean_env(monkeypatch):
         "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
     ):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
 
 
 @pytest.fixture
