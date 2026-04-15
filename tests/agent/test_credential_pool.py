@@ -334,6 +334,14 @@ def test_try_refresh_current_updates_only_current_entry(tmp_path, monkeypatch):
         tmp_path,
         {
             "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "device-access",
+                        "refresh_token": "device-refresh",
+                    }
+                }
+            },
             "credential_pool": {
                 "openai-codex": [
                     {

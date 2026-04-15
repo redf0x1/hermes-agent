@@ -2691,12 +2691,21 @@ class AIAgent:
         if isinstance(body, dict):
             payload = body.get("error") if isinstance(body.get("error"), dict) else body
         if isinstance(payload, dict):
-            reason = payload.get("code") or payload.get("error")
+            error_type = payload.get("type")
+            if isinstance(error_type, str) and error_type.strip():
+                context["type"] = error_type.strip()
+            reason = payload.get("code") or payload.get("error") or error_type
             if isinstance(reason, str) and reason.strip():
                 context["reason"] = reason.strip()
             message = payload.get("message") or payload.get("error_description")
             if isinstance(message, str) and message.strip():
                 context["message"] = message.strip()
+            resets_in_seconds = payload.get("resets_in_seconds")
+            if resets_in_seconds not in (None, ""):
+                try:
+                    context["resets_in_seconds"] = int(float(resets_in_seconds))
+                except (TypeError, ValueError):
+                    pass
             for key in ("resets_at", "reset_at"):
                 value = payload.get(key)
                 if value not in (None, ""):
@@ -2745,6 +2754,73 @@ class AIAgent:
                         context["reset_at"] = time.time() + float(sec_match.group(1))
 
         return context
+
+    @staticmethod
+    def _is_usage_limit_reached(error_context: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(error_context, dict):
+            return False
+        for key in ("type", "reason"):
+            value = error_context.get(key)
+            if isinstance(value, str) and value.strip().lower() == "usage_limit_reached":
+                return True
+        return False
+
+    @staticmethod
+    def _reset_seconds_from_error_context(error_context: Optional[Dict[str, Any]]) -> Optional[int]:
+        if not isinstance(error_context, dict):
+            return None
+
+        resets_in_seconds = error_context.get("resets_in_seconds")
+        if resets_in_seconds not in (None, ""):
+            try:
+                return max(0, int(float(resets_in_seconds)))
+            except (TypeError, ValueError):
+                pass
+
+        reset_at = error_context.get("reset_at")
+        if reset_at in (None, ""):
+            return None
+
+        reset_ts: Optional[float] = None
+        if isinstance(reset_at, (int, float)):
+            reset_ts = float(reset_at)
+        elif isinstance(reset_at, str):
+            raw = reset_at.strip()
+            if raw:
+                try:
+                    reset_ts = float(raw)
+                except ValueError:
+                    try:
+                        reset_ts = datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+                    except ValueError:
+                        reset_ts = None
+
+        if reset_ts is None:
+            return None
+        if reset_ts > 1_000_000_000_000:
+            reset_ts /= 1000.0
+        return max(0, int(round(reset_ts - time.time())))
+
+    @classmethod
+    def _format_reset_hint(cls, error_context: Optional[Dict[str, Any]]) -> str:
+        seconds = cls._reset_seconds_from_error_context(error_context)
+        if seconds is None:
+            return ""
+        if seconds < 60:
+            return f" (reset in ~{seconds}s)"
+        minutes, secs = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        days, hours = divmod(hours, 24)
+        parts = []
+        if days:
+            parts.append(f"{days}d")
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes:
+            parts.append(f"{minutes}m")
+        if not parts:
+            parts.append(f"{secs}s")
+        return f" (reset in ~{' '.join(parts)})"
 
     def _usage_summary_for_api_request_hook(self, response: Any) -> Optional[Dict[str, Any]]:
         """Token buckets for ``post_api_request`` plugins (no raw ``response`` object)."""
@@ -4755,6 +4831,21 @@ class AIAgent:
             return False, has_retried_429
 
         if effective_reason == FailoverReason.rate_limit:
+            if self._is_usage_limit_reached(error_context):
+                rotate_status = status_code if status_code is not None else 429
+                next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+                if next_entry is not None:
+                    self._emit_status(
+                        f"⚠️ Usage limit reached{self._format_reset_hint(error_context)} — rotating to next credential..."
+                    )
+                    logger.info(
+                        "Credential %s (usage_limit_reached) — rotated to pool entry %s",
+                        rotate_status,
+                        getattr(next_entry, "id", "?"),
+                    )
+                    self._swap_credential(next_entry)
+                    return True, False
+                return False, False
             if not has_retried_429:
                 return False, True
             rotate_status = status_code if status_code is not None else 429
