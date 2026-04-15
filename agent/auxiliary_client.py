@@ -651,11 +651,14 @@ def _read_codex_access_token() -> Optional[str]:
             return token
 
     try:
-        from hermes_cli.auth import _read_codex_tokens
+        from hermes_cli.auth import _read_codex_tokens, _codex_access_token_looks_usable
         data = _read_codex_tokens()
         tokens = data.get("tokens", {})
         access_token = tokens.get("access_token")
         if not isinstance(access_token, str) or not access_token.strip():
+            return None
+        if not _codex_access_token_looks_usable(access_token):
+            logger.warning("Codex auth store fallback token is unusable; ignoring singleton fallback")
             return None
 
         # Check JWT expiry — expired tokens block the auto chain and

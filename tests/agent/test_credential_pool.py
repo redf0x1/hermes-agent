@@ -388,6 +388,43 @@ def test_try_refresh_current_updates_only_current_entry(tmp_path, monkeypatch):
     assert secondary["refresh_token"] == "refresh-other"
 
 
+def test_load_pool_ignores_unusable_codex_singleton_tokens(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "access-new",
+                        "refresh_token": "refresh-new",
+                    }
+                }
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "stale-singleton",
+                        "label": "device_code",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "device_code",
+                        "access_token": "access-new",
+                        "refresh_token": "refresh-new",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    assert pool.entries() == []
+
+
 def test_load_pool_seeds_env_api_key(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-seeded")

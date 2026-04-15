@@ -1052,6 +1052,29 @@ def _codex_access_token_is_expiring(access_token: Any, skew_seconds: int) -> boo
     return float(exp) <= (time.time() + max(0, int(skew_seconds)))
 
 
+def _codex_access_token_looks_usable(access_token: Any) -> bool:
+    if not has_usable_secret(access_token, min_length=16):
+        return False
+    token = str(access_token).strip()
+    claims = _decode_jwt_claims(token)
+    if claims:
+        return True
+    return len(token) >= 32
+
+
+def _codex_refresh_token_looks_usable(refresh_token: Any) -> bool:
+    return has_usable_secret(refresh_token, min_length=16)
+
+
+def _codex_token_pair_looks_usable(tokens: Any) -> bool:
+    if not isinstance(tokens, dict):
+        return False
+    return (
+        _codex_access_token_looks_usable(tokens.get("access_token"))
+        and _codex_refresh_token_looks_usable(tokens.get("refresh_token"))
+    )
+
+
 def _qwen_cli_auth_path() -> Path:
     return Path.home() / ".qwen" / "oauth_creds.json"
 
@@ -1275,11 +1298,25 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
             code="codex_auth_missing_access_token",
             relogin_required=True,
         )
+    if not _codex_access_token_looks_usable(access_token):
+        raise AuthError(
+            "Codex auth contains an unusable access_token. Run `hermes auth` to re-authenticate.",
+            provider="openai-codex",
+            code="codex_auth_invalid_access_token",
+            relogin_required=True,
+        )
     if not isinstance(refresh_token, str) or not refresh_token.strip():
         raise AuthError(
             "Codex auth is missing refresh_token. Run `hermes auth` to re-authenticate.",
             provider="openai-codex",
             code="codex_auth_missing_refresh_token",
+            relogin_required=True,
+        )
+    if not _codex_refresh_token_looks_usable(refresh_token):
+        raise AuthError(
+            "Codex auth contains an unusable refresh_token. Run `hermes auth` to re-authenticate.",
+            provider="openai-codex",
+            code="codex_auth_invalid_refresh_token",
             relogin_required=True,
         )
     return {
@@ -1477,12 +1514,9 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
     try:
         payload = json.loads(auth_path.read_text())
         tokens = payload.get("tokens")
-        if not isinstance(tokens, dict):
+        if not _codex_token_pair_looks_usable(tokens):
             return None
         access_token = tokens.get("access_token")
-        refresh_token = tokens.get("refresh_token")
-        if not access_token or not refresh_token:
-            return None
         # Reject expired tokens — importing stale tokens from ~/.codex/
         # that can't be refreshed leaves the user stuck with "Login successful!"
         # but no working credentials.
@@ -2339,7 +2373,10 @@ def get_codex_auth_status() -> Dict[str, Any]:
                     getattr(entry, "runtime_api_key", None)
                     or getattr(entry, "access_token", "")
                 )
-                if api_key and not _codex_access_token_is_expiring(api_key, 0):
+                if (
+                    _codex_access_token_looks_usable(api_key)
+                    and not _codex_access_token_is_expiring(api_key, 0)
+                ):
                     return {
                         "logged_in": True,
                         "auth_store": str(_auth_file_path()),
