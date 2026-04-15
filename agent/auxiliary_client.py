@@ -45,7 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
-from agent.credential_pool import load_pool
+from agent.credential_pool import load_pool, list_custom_pool_providers
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 
@@ -165,16 +165,134 @@ def _to_openai_base_url(base_url: str) -> str:
     return url
 
 
-def _select_pool_entry(provider: str) -> Tuple[bool, Optional[Any]]:
-    """Return (pool_exists_for_provider, selected_entry)."""
+def _load_provider_pool(provider: Optional[str]) -> Optional[Any]:
+    normalized = str(provider or "").strip()
+    if not normalized or normalized in {"auto", "custom"}:
+        return None
     try:
-        pool = load_pool(provider)
+        pool = load_pool(normalized)
     except Exception as exc:
-        logger.debug("Auxiliary client: could not load pool for %s: %s", provider, exc)
-        return False, None
+        logger.debug("Auxiliary client: could not load pool for %s: %s", normalized, exc)
+        return None
     if not pool or not pool.has_credentials():
+        return None
+    return pool
+
+
+def _provider_uses_dynamic_pool_strategy(provider: Optional[str]) -> bool:
+    pool = _load_provider_pool(provider)
+    if pool is None:
+        return False
+    try:
+        return bool(pool.uses_dynamic_strategy())
+    except Exception as exc:
+        logger.debug("Auxiliary client: could not inspect pool strategy for %s: %s", provider, exc)
+        return False
+
+
+def _auto_uses_dynamic_pool_strategy() -> bool:
+    candidates = {"openrouter", "nous", "openai-codex", "anthropic"}
+    try:
+        from hermes_cli.auth import PROVIDER_REGISTRY
+        candidates.update(PROVIDER_REGISTRY.keys())
+    except Exception:
+        pass
+    try:
+        candidates.update(list_custom_pool_providers())
+    except Exception:
+        pass
+    return any(_provider_uses_dynamic_pool_strategy(provider) for provider in candidates)
+
+
+def _attach_pool_metadata(client: Any, provider: Optional[str], credential_id: Optional[str]) -> Any:
+    if client is None or not provider or not credential_id:
+        return client
+    try:
+        setattr(client, "_hermes_pool_provider", provider)
+        setattr(client, "_hermes_pool_entry_id", credential_id)
+    except Exception:
+        pass
+    return client
+
+
+def _copy_pool_metadata(source: Any, target: Any) -> Any:
+    if source is None or target is None:
+        return target
+    return _attach_pool_metadata(
+        target,
+        getattr(source, "_hermes_pool_provider", None),
+        getattr(source, "_hermes_pool_entry_id", None),
+    )
+
+
+def _mark_provider_pool_used(provider: Optional[str], credential_id: Optional[str] = None) -> None:
+    pool = _load_provider_pool(provider)
+    if pool is None:
+        return
+    try:
+        if credential_id:
+            pool.mark_used(credential_id)
+        else:
+            pool.mark_used()
+    except Exception as exc:
+        logger.debug("Auxiliary client: could not mark pooled credential used for %s: %s", provider, exc)
+
+
+def _mark_client_pool_used(client: Any, fallback_provider: Optional[str] = None) -> None:
+    provider = getattr(client, "_hermes_pool_provider", None)
+    if not isinstance(provider, str) or not provider.strip():
+        provider = fallback_provider
+    credential_id = getattr(client, "_hermes_pool_entry_id", None)
+    if not isinstance(credential_id, str) or not credential_id.strip():
+        credential_id = None
+    _mark_provider_pool_used(provider, credential_id)
+
+
+def _resolve_cached_or_live_client(
+    provider: str,
+    model: Optional[str] = None,
+    *,
+    async_mode: bool = False,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    api_mode: Optional[str] = None,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> Tuple[Optional[Any], Optional[str]]:
+    if not base_url and not api_key and (
+        _provider_uses_dynamic_pool_strategy(provider)
+        or (provider == "auto" and _auto_uses_dynamic_pool_strategy())
+    ):
+        return resolve_provider_client(
+            provider,
+            model,
+            async_mode=async_mode,
+            explicit_base_url=base_url,
+            explicit_api_key=api_key,
+            api_mode=api_mode,
+            main_runtime=main_runtime,
+        )
+    return _get_cached_client(
+        provider,
+        model,
+        async_mode=async_mode,
+        base_url=base_url,
+        api_key=api_key,
+        api_mode=api_mode,
+        main_runtime=main_runtime,
+    )
+
+
+def _select_pool_entry(provider: str, *, for_request: bool = False) -> Tuple[bool, Optional[Any]]:
+    """Return (pool_exists_for_provider, selected_entry)."""
+    pool = _load_provider_pool(provider)
+    if pool is None:
         return False, None
     try:
+        if for_request and hasattr(pool, "select_for_request"):
+            return True, pool.select_for_request()
+        current = getattr(pool, "current", lambda: None)()
+        if current is not None:
+            return True, current
         return True, pool.select()
     except Exception as exc:
         logger.debug("Auxiliary client: could not select pool entry for %s: %s", provider, exc)
@@ -587,13 +705,13 @@ class AsyncAnthropicAuxiliaryClient:
         self.base_url = sync_wrapper.base_url
 
 
-def _read_nous_auth() -> Optional[dict]:
+def _read_nous_auth(*, for_request: bool = False) -> Optional[dict]:
     """Read and validate ~/.hermes/auth.json for an active Nous provider.
 
     Returns the provider state dict if Nous is active with tokens,
     otherwise None.
     """
-    pool_present, entry = _select_pool_entry("nous")
+    pool_present, entry = _select_pool_entry("nous", for_request=for_request)
     if pool_present:
         if entry is None:
             return None
@@ -607,6 +725,7 @@ def _read_nous_auth() -> Optional[dict]:
             "scope": getattr(entry, "scope", None),
             "token_type": getattr(entry, "token_type", "Bearer"),
             "source": "pool",
+            "pool_entry_id": getattr(entry, "id", None),
         }
 
     try:
@@ -705,7 +824,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                 pass
             return _try_anthropic()
 
-        pool_present, entry = _select_pool_entry(provider_id)
+        pool_present, entry = _select_pool_entry(provider_id, for_request=True)
         if pool_present:
             api_key = _pool_runtime_api_key(entry)
             if not api_key:
@@ -725,7 +844,9 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
                 from hermes_cli.models import copilot_default_headers
 
                 extra["default_headers"] = copilot_default_headers()
-            return OpenAI(api_key=api_key, base_url=base_url, **extra), model
+            client = OpenAI(api_key=api_key, base_url=base_url, **extra)
+            _attach_pool_metadata(client, provider_id, getattr(entry, "id", None))
+            return client, model
 
         creds = resolve_api_key_provider_credentials(provider_id)
         api_key = str(creds.get("api_key", "")).strip()
@@ -756,15 +877,17 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
 
 
 def _try_openrouter() -> Tuple[Optional[OpenAI], Optional[str]]:
-    pool_present, entry = _select_pool_entry("openrouter")
+    pool_present, entry = _select_pool_entry("openrouter", for_request=True)
     if pool_present:
         or_key = _pool_runtime_api_key(entry)
         if not or_key:
             return None, None
         base_url = _pool_runtime_base_url(entry, OPENROUTER_BASE_URL) or OPENROUTER_BASE_URL
         logger.debug("Auxiliary client: OpenRouter via pool")
-        return OpenAI(api_key=or_key, base_url=base_url,
-                       default_headers=_OR_HEADERS), _OPENROUTER_MODEL
+        client = OpenAI(api_key=or_key, base_url=base_url,
+                        default_headers=_OR_HEADERS)
+        _attach_pool_metadata(client, "openrouter", getattr(entry, "id", None))
+        return client, _OPENROUTER_MODEL
 
     or_key = os.getenv("OPENROUTER_API_KEY")
     if not or_key:
@@ -775,7 +898,7 @@ def _try_openrouter() -> Tuple[Optional[OpenAI], Optional[str]]:
 
 
 def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
-    nous = _read_nous_auth()
+    nous = _read_nous_auth(for_request=True)
     if not nous:
         return None, None
     global auxiliary_is_nous
@@ -795,13 +918,13 @@ def _try_nous(vision: bool = False) -> Tuple[Optional[OpenAI], Optional[str]]:
                          model, "vision" if vision else "text")
     except Exception:
         pass
-    return (
-        OpenAI(
-            api_key=_nous_api_key(nous),
-            base_url=str(nous.get("inference_base_url") or _nous_base_url()).rstrip("/"),
-        ),
-        model,
+    client = OpenAI(
+        api_key=_nous_api_key(nous),
+        base_url=str(nous.get("inference_base_url") or _nous_base_url()).rstrip("/"),
     )
+    if nous.get("source") == "pool":
+        _attach_pool_metadata(client, "nous", str(nous.get("pool_entry_id") or "") or None)
+    return client, model
 
 
 def _read_main_model() -> str:
@@ -919,7 +1042,7 @@ def _try_custom_endpoint() -> Tuple[Optional[OpenAI], Optional[str]]:
 
 
 def _try_codex() -> Tuple[Optional[Any], Optional[str]]:
-    pool_present, entry = _select_pool_entry("openai-codex")
+    pool_present, entry = _select_pool_entry("openai-codex", for_request=True)
     if pool_present:
         codex_token = _pool_runtime_api_key(entry)
         if codex_token:
@@ -936,7 +1059,10 @@ def _try_codex() -> Tuple[Optional[Any], Optional[str]]:
         base_url = _CODEX_AUX_BASE_URL
     logger.debug("Auxiliary client: Codex OAuth (%s via Responses API)", _CODEX_AUX_MODEL)
     real_client = OpenAI(api_key=codex_token, base_url=base_url)
-    return CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL), _CODEX_AUX_MODEL
+    wrapped = CodexAuxiliaryClient(real_client, _CODEX_AUX_MODEL)
+    if pool_present and entry is not None:
+        _attach_pool_metadata(wrapped, "openai-codex", getattr(entry, "id", None))
+    return wrapped, _CODEX_AUX_MODEL
 
 
 def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
@@ -945,7 +1071,7 @@ def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
     except ImportError:
         return None, None
 
-    pool_present, entry = _select_pool_entry("anthropic")
+    pool_present, entry = _select_pool_entry("anthropic", for_request=True)
     if pool_present:
         if entry is None:
             return None, None
@@ -984,7 +1110,10 @@ def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
         # missing — build_anthropic_client raises ImportError at call time
         # when _anthropic_sdk is None.  Treat as unavailable.
         return None, None
-    return AnthropicAuxiliaryClient(real_client, model, token, base_url, is_oauth=is_oauth), model
+    wrapped = AnthropicAuxiliaryClient(real_client, model, token, base_url, is_oauth=is_oauth)
+    if pool_present and entry is not None:
+        _attach_pool_metadata(wrapped, "anthropic", getattr(entry, "id", None))
+    return wrapped, model
 
 
 _AUTO_PROVIDER_LABELS = {
@@ -1221,9 +1350,9 @@ def _to_async_client(sync_client, model: str):
     from openai import AsyncOpenAI
 
     if isinstance(sync_client, CodexAuxiliaryClient):
-        return AsyncCodexAuxiliaryClient(sync_client), model
+        return _copy_pool_metadata(sync_client, AsyncCodexAuxiliaryClient(sync_client)), model
     if isinstance(sync_client, AnthropicAuxiliaryClient):
-        return AsyncAnthropicAuxiliaryClient(sync_client), model
+        return _copy_pool_metadata(sync_client, AsyncAnthropicAuxiliaryClient(sync_client)), model
     try:
         from agent.copilot_acp_client import CopilotACPClient
         if isinstance(sync_client, CopilotACPClient):
@@ -1244,7 +1373,7 @@ def _to_async_client(sync_client, model: str):
         async_kwargs["default_headers"] = copilot_default_headers()
     elif "api.kimi.com" in base_lower:
         async_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.30.0"}
-    return AsyncOpenAI(**async_kwargs), model
+    return _copy_pool_metadata(sync_client, AsyncOpenAI(**async_kwargs)), model
 
 
 def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optional[str]:
@@ -1789,8 +1918,12 @@ def resolve_vision_provider_client(
         sync_client, default_model = _resolve_strict_vision_backend(requested)
         return _finalize(requested, sync_client, default_model)
 
-    client, final_model = _get_cached_client(requested, resolved_model, async_mode,
-                                             api_mode=resolved_api_mode)
+    client, final_model = _resolve_cached_or_live_client(
+        requested,
+        resolved_model,
+        async_mode=async_mode,
+        api_mode=resolved_api_mode,
+    )
     if client is None:
         return requested, None, None
     return requested, client, final_model
@@ -2327,7 +2460,7 @@ def call_llm(
             )
         resolved_provider = effective_provider or resolved_provider
     else:
-        client, final_model = _get_cached_client(
+        client, final_model = _resolve_cached_or_live_client(
             resolved_provider,
             resolved_model,
             base_url=resolved_base_url,
@@ -2382,16 +2515,20 @@ def call_llm(
 
     # Handle max_tokens vs max_completion_tokens retry, then payment fallback.
     try:
-        return _validate_llm_response(
+        response = _validate_llm_response(
             client.chat.completions.create(**kwargs), task)
+        _mark_client_pool_used(client, resolved_provider)
+        return response
     except Exception as first_err:
         err_str = str(first_err)
         if "max_tokens" in err_str or "unsupported_parameter" in err_str:
             kwargs.pop("max_tokens", None)
             kwargs["max_completion_tokens"] = max_tokens
             try:
-                return _validate_llm_response(
+                response = _validate_llm_response(
                     client.chat.completions.create(**kwargs), task)
+                _mark_client_pool_used(client, resolved_provider)
+                return response
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -2428,8 +2565,10 @@ def call_llm(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
                     extra_body=extra_body)
-                return _validate_llm_response(
+                response = _validate_llm_response(
                     fb_client.chat.completions.create(**fb_kwargs), task)
+                _mark_client_pool_used(fb_client, fb_label)
+                return response
         raise
 
 
@@ -2535,7 +2674,7 @@ async def async_call_llm(
             )
         resolved_provider = effective_provider or resolved_provider
     else:
-        client, final_model = _get_cached_client(
+        client, final_model = _resolve_cached_or_live_client(
             resolved_provider,
             resolved_model,
             async_mode=True,
@@ -2574,16 +2713,20 @@ async def async_call_llm(
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     try:
-        return _validate_llm_response(
+        response = _validate_llm_response(
             await client.chat.completions.create(**kwargs), task)
+        _mark_client_pool_used(client, resolved_provider)
+        return response
     except Exception as first_err:
         err_str = str(first_err)
         if "max_tokens" in err_str or "unsupported_parameter" in err_str:
             kwargs.pop("max_tokens", None)
             kwargs["max_completion_tokens"] = max_tokens
             try:
-                return _validate_llm_response(
+                response = _validate_llm_response(
                     await client.chat.completions.create(**kwargs), task)
+                _mark_client_pool_used(client, resolved_provider)
+                return response
             except Exception as retry_err:
                 # If the max_tokens retry also hits a payment or connection
                 # error, fall through to the fallback chain below.
@@ -2610,6 +2753,8 @@ async def async_call_llm(
                 async_fb, async_fb_model = _to_async_client(fb_client, fb_model or "")
                 if async_fb_model and async_fb_model != fb_kwargs.get("model"):
                     fb_kwargs["model"] = async_fb_model
-                return _validate_llm_response(
+                response = _validate_llm_response(
                     await async_fb.chat.completions.create(**fb_kwargs), task)
+                _mark_client_pool_used(async_fb, fb_label)
+                return response
         raise

@@ -2566,6 +2566,22 @@ class TestNousCredentialRefresh:
 
 
 class TestCredentialPoolRecovery:
+    def test_prepare_primary_credential_for_request_reselects_dynamic_entry(self, agent):
+        selected_entry = SimpleNamespace(
+            id="secondary",
+            runtime_api_key="rotated-key",
+            runtime_base_url="https://rotated.example/v1",
+        )
+        pool = MagicMock()
+        pool.select_for_request.return_value = selected_entry
+        agent._credential_pool = pool
+        agent._swap_credential = MagicMock()
+
+        agent._prepare_primary_credential_for_request()
+
+        pool.select_for_request.assert_called_once_with()
+        agent._swap_credential.assert_called_once_with(selected_entry)
+
     def test_recover_with_pool_rotates_on_402(self, agent):
         current = SimpleNamespace(label="primary")
         next_entry = SimpleNamespace(label="secondary")
@@ -2731,6 +2747,52 @@ class TestCredentialPoolRecovery:
         assert context["message"] == "Weekly credits exhausted."
         assert context["reset_at"] == "2026-04-12T10:30:00Z"
 
+    def test_extract_api_error_context_captures_usage_limit_metadata(self, agent):
+        response = SimpleNamespace(headers={})
+        error = SimpleNamespace(
+            body={
+                "error": {
+                    "type": "usage_limit_reached",
+                    "message": "The usage limit has been reached",
+                    "resets_in_seconds": 6578,
+                    "resets_at": 1776227745,
+                }
+            },
+            response=response,
+        )
+
+        context = agent._extract_api_error_context(error)
+
+        assert context["type"] == "usage_limit_reached"
+        assert context["reason"] == "usage_limit_reached"
+        assert context["message"] == "The usage limit has been reached"
+        assert context["resets_in_seconds"] == 6578
+        assert context["reset_at"] == 1776227745
+
+    def test_recover_with_pool_rotates_immediately_on_usage_limit_429(self, agent):
+        next_entry = SimpleNamespace(label="secondary")
+
+        class _Pool:
+            def mark_exhausted_and_rotate(self, *, status_code, error_context=None):
+                assert status_code == 429
+                assert error_context["type"] == "usage_limit_reached"
+                return next_entry
+
+        agent._credential_pool = _Pool()
+        agent._swap_credential = MagicMock()
+        agent._emit_status = MagicMock()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=False,
+            error_context={"type": "usage_limit_reached", "resets_in_seconds": 6578},
+        )
+
+        assert recovered is True
+        assert retry_same is False
+        agent._swap_credential.assert_called_once_with(next_entry)
+        agent._emit_status.assert_called_once()
+
     def test_recover_with_pool_passes_error_context_on_rotated_429(self, agent):
         next_entry = SimpleNamespace(label="secondary")
         captured = {}
@@ -2757,6 +2819,174 @@ class TestCredentialPoolRecovery:
         assert retry_same is False
         assert captured["status_code"] == 429
         assert captured["error_context"]["reason"] == "device_code_exhausted"
+
+    def test_run_conversation_usage_limit_fails_fast_without_alternative(self, agent):
+        class _UsageLimitError(Exception):
+            status_code = 429
+
+            def __init__(self):
+                self.body = {
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "The usage limit has been reached",
+                        "resets_in_seconds": 6578,
+                        "resets_at": 1776227745,
+                    }
+                }
+                self.response = SimpleNamespace(headers={})
+
+            def __str__(self):
+                return "HTTP 429: The usage limit has been reached"
+
+        calls = {"count": 0}
+
+        def _fake_api_call(api_kwargs):
+            calls["count"] += 1
+            raise _UsageLimitError()
+
+        pool = MagicMock()
+        pool.mark_exhausted_and_rotate.return_value = None
+        pool.has_available.return_value = False
+
+        agent._credential_pool = pool
+        agent._interruptible_api_call = _fake_api_call
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        agent._save_session_log = lambda *args, **kwargs: None
+        agent._fallback_chain = []
+        agent._fallback_index = 0
+        agent._try_activate_fallback = MagicMock(return_value=False)
+
+        with (
+            patch("run_agent.time.sleep", return_value=None) as mock_sleep,
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert calls["count"] == 1
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert "usage limit" in result["error"].lower()
+        assert "reset" in result["error"].lower()
+        mock_sleep.assert_not_called()
+
+    def test_run_conversation_usage_limit_prefers_fallback_without_backoff(self, agent):
+        class _UsageLimitError(Exception):
+            status_code = 429
+
+            def __init__(self):
+                self.body = {
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "The usage limit has been reached",
+                        "resets_in_seconds": 6578,
+                    }
+                }
+                self.response = SimpleNamespace(headers={})
+
+            def __str__(self):
+                return "HTTP 429: The usage limit has been reached"
+
+        responses = [_UsageLimitError(), _mock_response(content="Recovered via fallback")]
+        calls = {"count": 0}
+
+        def _fake_api_call(api_kwargs):
+            calls["count"] += 1
+            result = responses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        pool = MagicMock()
+        pool.mark_exhausted_and_rotate.return_value = None
+        pool.has_available.return_value = False
+
+        agent._credential_pool = pool
+        agent._interruptible_api_call = _fake_api_call
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        agent._save_session_log = lambda *args, **kwargs: None
+        agent._fallback_chain = [{"model": "fallback/model"}]
+        agent._fallback_index = 0
+        agent._try_activate_fallback = MagicMock(return_value=True)
+
+        with (
+            patch("run_agent.time.sleep", return_value=None) as mock_sleep,
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert calls["count"] == 2
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered via fallback"
+        agent._try_activate_fallback.assert_called_once_with()
+        mock_sleep.assert_not_called()
+
+    def test_prepare_primary_credential_for_request_skips_fallback_runtime(self, agent):
+        pool = MagicMock()
+        agent._credential_pool = pool
+        agent._fallback_activated = True
+        agent._swap_credential = MagicMock()
+
+        agent._prepare_primary_credential_for_request()
+
+        pool.select_for_request.assert_not_called()
+        agent._swap_credential.assert_not_called()
+
+    def test_mark_primary_pool_used_skips_fallback_runtime(self, agent):
+        pool = MagicMock()
+        agent._credential_pool = pool
+        agent._fallback_activated = True
+
+        agent._mark_primary_pool_used()
+
+        pool.mark_used.assert_not_called()
+
+    def test_run_conversation_marks_primary_pool_used_once_after_retry(self, agent):
+        class _RateLimitError(Exception):
+            status_code = 429
+
+            def __str__(self):
+                return "Error code: 429 - Rate limit exceeded."
+
+        responses = [_RateLimitError(), _mock_response(content="Recovered")]
+
+        def _fake_api_call(api_kwargs):
+            result = responses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        pool = MagicMock()
+        agent._credential_pool = pool
+        agent._prepare_primary_credential_for_request = MagicMock()
+        agent._recover_with_credential_pool = MagicMock(return_value=(False, True))
+        agent._interruptible_api_call = _fake_api_call
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        agent._save_session_log = lambda *args, **kwargs: None
+
+        with (
+            patch("run_agent.time.sleep", return_value=None),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered"
+        pool.mark_used.assert_called_once_with()
+
+
+class TestAnthropicPrimaryCredentialSelection:
+    def test_anthropic_messages_create_prepares_pool_selection(self, agent):
+        agent.api_mode = "anthropic_messages"
+        agent._anthropic_client = MagicMock()
+        agent._prepare_primary_credential_for_request = MagicMock()
+        agent._try_refresh_anthropic_client_credentials = MagicMock()
+
+        agent._anthropic_messages_create({"messages": []})
+
+        agent._prepare_primary_credential_for_request.assert_called_once_with()
 
 
 class TestMaxTokensParam:

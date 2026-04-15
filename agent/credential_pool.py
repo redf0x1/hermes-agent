@@ -255,6 +255,13 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
         or error_context.get("retry_until")
     )
     parsed_reset_at = _parse_absolute_timestamp(reset_at)
+    if parsed_reset_at is None:
+        resets_in_seconds = error_context.get("resets_in_seconds")
+        if resets_in_seconds not in (None, ""):
+            try:
+                parsed_reset_at = time.time() + max(0.0, float(resets_in_seconds))
+            except (TypeError, ValueError):
+                pass
     if parsed_reset_at is None and isinstance(message, str):
         retry_delay_seconds = _extract_retry_delay_seconds(message)
         if retry_delay_seconds is not None:
@@ -371,34 +378,134 @@ class CredentialPool:
         self._lock = threading.Lock()
         self._active_leases: Dict[str, int] = {}
         self._max_concurrent = DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL
+        self._dirty_ids: Set[str] = set()
+        self._removed_ids: Set[str] = set()
+
+    def _read_persisted_entries_unlocked(self) -> List[PooledCredential]:
+        auth_store = _load_auth_store()
+        pool = auth_store.get("credential_pool")
+        provider_entries = pool.get(self.provider) if isinstance(pool, dict) else None
+        if not isinstance(provider_entries, list):
+            return []
+        return [PooledCredential.from_dict(self.provider, payload) for payload in provider_entries]
+
+    def _sync_from_store_if_clean_unlocked(self) -> None:
+        if self._dirty_ids or self._removed_ids:
+            return
+        with _auth_store_lock():
+            latest_entries = sorted(self._read_persisted_entries_unlocked(), key=lambda entry: entry.priority)
+        latest_ids = {entry.id for entry in latest_entries}
+        self._entries = latest_entries
+        if self._current_id not in latest_ids:
+            self._current_id = None
+        self._active_leases = {
+            credential_id: count
+            for credential_id, count in self._active_leases.items()
+            if credential_id in latest_ids
+        }
+
+    def _mark_dirty(self, *entry_ids: Optional[str]) -> None:
+        for entry_id in entry_ids:
+            if not entry_id:
+                continue
+            self._dirty_ids.add(entry_id)
+            self._removed_ids.discard(entry_id)
 
     def has_credentials(self) -> bool:
         return bool(self._entries)
 
     def has_available(self) -> bool:
         """True if at least one entry is not currently in exhaustion cooldown."""
-        return bool(self._available_entries())
+        with self._lock:
+            self._sync_from_store_if_clean_unlocked()
+            return bool(self._available_entries())
 
     def entries(self) -> List[PooledCredential]:
-        return list(self._entries)
+        with self._lock:
+            self._sync_from_store_if_clean_unlocked()
+            return list(self._entries)
 
     def current(self) -> Optional[PooledCredential]:
         if not self._current_id:
             return None
         return next((entry for entry in self._entries if entry.id == self._current_id), None)
 
+    def uses_dynamic_strategy(self) -> bool:
+        return self._strategy in {
+            STRATEGY_ROUND_ROBIN,
+            STRATEGY_RANDOM,
+            STRATEGY_LEAST_USED,
+        }
+
+    def select_for_request(self) -> Optional[PooledCredential]:
+        with self._lock:
+            self._sync_from_store_if_clean_unlocked()
+            return self._select_unlocked()
+
+    def mark_used(self, credential_id: Optional[str] = None) -> Optional[PooledCredential]:
+        with self._lock:
+            self._sync_from_store_if_clean_unlocked()
+            entry = None
+            if credential_id:
+                entry = next((candidate for candidate in self._entries if candidate.id == credential_id), None)
+            else:
+                entry = self.current()
+            if entry is None:
+                return None
+            updated = replace(
+                entry,
+                request_count=int(getattr(entry, "request_count", 0) or 0) + 1,
+                last_status=STATUS_OK,
+                last_status_at=None,
+                last_error_code=None,
+                last_error_reason=None,
+                last_error_message=None,
+                last_error_reset_at=None,
+            )
+            self._replace_entry(entry, updated)
+            if self._current_id == entry.id:
+                self._current_id = updated.id
+            self._persist()
+            return updated
+
     def _replace_entry(self, old: PooledCredential, new: PooledCredential) -> None:
         """Swap an entry in-place by id, preserving sort order."""
         for idx, entry in enumerate(self._entries):
             if entry.id == old.id:
                 self._entries[idx] = new
+                self._mark_dirty(new.id)
                 return
 
     def _persist(self) -> None:
-        write_credential_pool(
-            self.provider,
-            [entry.to_dict() for entry in self._entries],
-        )
+        if not self._dirty_ids and not self._removed_ids:
+            return
+
+        with _auth_store_lock():
+            latest_entries = self._read_persisted_entries_unlocked()
+            latest_by_id = {entry.id: entry for entry in latest_entries}
+            current_by_id = {entry.id: entry for entry in self._entries}
+
+            for removed_id in self._removed_ids:
+                latest_by_id.pop(removed_id, None)
+
+            for dirty_id in self._dirty_ids:
+                entry = current_by_id.get(dirty_id)
+                if entry is not None:
+                    latest_by_id[dirty_id] = entry
+
+            merged_entries = sorted(latest_by_id.values(), key=lambda entry: entry.priority)
+            merged_entries = [
+                replace(entry, priority=index)
+                for index, entry in enumerate(merged_entries)
+            ]
+            self._entries = merged_entries
+            write_credential_pool(
+                self.provider,
+                [entry.to_dict() for entry in merged_entries],
+            )
+
+        self._dirty_ids.clear()
+        self._removed_ids.clear()
 
     def _mark_exhausted(
         self,
@@ -768,6 +875,7 @@ class CredentialPool:
 
     def select(self) -> Optional[PooledCredential]:
         with self._lock:
+            self._sync_from_store_if_clean_unlocked()
             return self._select_unlocked()
 
     def _available_entries(self, *, clear_expired: bool = False, refresh: bool = False) -> List[PooledCredential]:
@@ -849,6 +957,7 @@ class CredentialPool:
             rotated = [candidate for candidate in self._entries if candidate.id != entry.id]
             rotated.append(replace(entry, priority=len(self._entries) - 1))
             self._entries = [replace(candidate, priority=idx) for idx, candidate in enumerate(rotated)]
+            self._mark_dirty(*(candidate.id for candidate in self._entries))
             self._persist()
             self._current_id = entry.id
             return self.current() or entry
@@ -858,11 +967,13 @@ class CredentialPool:
         return entry
 
     def peek(self) -> Optional[PooledCredential]:
-        current = self.current()
-        if current is not None:
-            return current
-        available = self._available_entries()
-        return available[0] if available else None
+        with self._lock:
+            self._sync_from_store_if_clean_unlocked()
+            current = self.current()
+            if current is not None:
+                return current
+            available = self._available_entries()
+            return available[0] if available else None
 
     def mark_exhausted_and_rotate(
         self,
@@ -871,6 +982,7 @@ class CredentialPool:
         error_context: Optional[Dict[str, Any]] = None,
     ) -> Optional[PooledCredential]:
         with self._lock:
+            self._sync_from_store_if_clean_unlocked()
             entry = self.current() or self._select_unlocked()
             if entry is None:
                 return None
@@ -896,6 +1008,7 @@ class CredentialPool:
         still return the least-leased one instead of blocking.
         """
         with self._lock:
+            self._sync_from_store_if_clean_unlocked()
             if credential_id:
                 self._active_leases[credential_id] = self._active_leases.get(credential_id, 0) + 1
                 self._current_id = credential_id
@@ -929,6 +1042,7 @@ class CredentialPool:
 
     def try_refresh_current(self) -> Optional[PooledCredential]:
         with self._lock:
+            self._sync_from_store_if_clean_unlocked()
             return self._try_refresh_current_unlocked()
 
     def _try_refresh_current_unlocked(self) -> Optional[PooledCredential]:
@@ -941,41 +1055,48 @@ class CredentialPool:
         return refreshed
 
     def reset_statuses(self) -> int:
-        count = 0
-        new_entries = []
-        for entry in self._entries:
-            if entry.last_status or entry.last_status_at or entry.last_error_code:
-                new_entries.append(
-                    replace(
-                        entry,
-                        last_status=None,
-                        last_status_at=None,
-                        last_error_code=None,
-                        last_error_reason=None,
-                        last_error_message=None,
-                        last_error_reset_at=None,
+        with self._lock:
+            self._sync_from_store_if_clean_unlocked()
+            count = 0
+            new_entries = []
+            for entry in self._entries:
+                if entry.last_status or entry.last_status_at or entry.last_error_code:
+                    new_entries.append(
+                        replace(
+                            entry,
+                            last_status=None,
+                            last_status_at=None,
+                            last_error_code=None,
+                            last_error_reason=None,
+                            last_error_message=None,
+                            last_error_reset_at=None,
+                        )
                     )
-                )
-                count += 1
-            else:
-                new_entries.append(entry)
-        if count:
-            self._entries = new_entries
-            self._persist()
-        return count
+                    count += 1
+                else:
+                    new_entries.append(entry)
+            if count:
+                self._entries = new_entries
+                self._mark_dirty(*(entry.id for entry in self._entries))
+                self._persist()
+            return count
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
-        if index < 1 or index > len(self._entries):
-            return None
-        removed = self._entries.pop(index - 1)
-        self._entries = [
-            replace(entry, priority=new_priority)
-            for new_priority, entry in enumerate(self._entries)
-        ]
-        self._persist()
-        if self._current_id == removed.id:
-            self._current_id = None
-        return removed
+        with self._lock:
+            self._sync_from_store_if_clean_unlocked()
+            if index < 1 or index > len(self._entries):
+                return None
+            removed = self._entries.pop(index - 1)
+            self._removed_ids.add(removed.id)
+            self._entries = [
+                replace(entry, priority=new_priority)
+                for new_priority, entry in enumerate(self._entries)
+            ]
+            self._mark_dirty(*(entry.id for entry in self._entries))
+            self._persist()
+            if self._current_id == removed.id:
+                self._current_id = None
+            return removed
 
     def resolve_target(self, target: Any) -> Tuple[Optional[int], Optional[PooledCredential], Optional[str]]:
         raw = str(target or "").strip()
@@ -1003,10 +1124,13 @@ class CredentialPool:
         return None, None, f'No credential matching "{raw}".'
 
     def add_entry(self, entry: PooledCredential) -> PooledCredential:
-        entry = replace(entry, priority=_next_priority(self._entries))
-        self._entries.append(entry)
-        self._persist()
-        return entry
+        with self._lock:
+            self._sync_from_store_if_clean_unlocked()
+            entry = replace(entry, priority=_next_priority(self._entries))
+            self._entries.append(entry)
+            self._mark_dirty(entry.id)
+            self._persist()
+            return entry
 
 
 def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, payload: Dict[str, Any]) -> bool:
@@ -1393,24 +1517,28 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
-    raw_entries = read_credential_pool(provider)
-    entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries]
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        pool = auth_store.get("credential_pool")
+        provider_entries = pool.get(provider) if isinstance(pool, dict) else None
+        raw_entries = list(provider_entries) if isinstance(provider_entries, list) else []
+        entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries]
 
-    if provider.startswith(CUSTOM_POOL_PREFIX):
-        # Custom endpoint pool — seed from custom_providers config and model config
-        custom_changed, custom_sources = _seed_custom_pool(provider, entries)
-        changed = custom_changed
-        changed |= _prune_stale_seeded_entries(entries, custom_sources)
-    else:
-        singleton_changed, singleton_sources = _seed_from_singletons(provider, entries)
-        env_changed, env_sources = _seed_from_env(provider, entries)
-        changed = singleton_changed or env_changed
-        changed |= _prune_stale_seeded_entries(entries, singleton_sources | env_sources)
-        changed |= _normalize_pool_priorities(provider, entries)
+        if provider.startswith(CUSTOM_POOL_PREFIX):
+            # Custom endpoint pool — seed from custom_providers config and model config
+            custom_changed, custom_sources = _seed_custom_pool(provider, entries)
+            changed = custom_changed
+            changed |= _prune_stale_seeded_entries(entries, custom_sources)
+        else:
+            singleton_changed, singleton_sources = _seed_from_singletons(provider, entries)
+            env_changed, env_sources = _seed_from_env(provider, entries)
+            changed = singleton_changed or env_changed
+            changed |= _prune_stale_seeded_entries(entries, singleton_sources | env_sources)
+            changed |= _normalize_pool_priorities(provider, entries)
 
-    if changed:
-        write_credential_pool(
-            provider,
-            [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
-        )
+        if changed:
+            write_credential_pool(
+                provider,
+                [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
+            )
     return CredentialPool(provider, entries)

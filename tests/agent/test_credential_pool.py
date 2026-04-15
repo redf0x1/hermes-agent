@@ -8,6 +8,13 @@ import time
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _disable_host_codex_cli_import(monkeypatch):
+    """Keep host ~/.codex/auth.json from leaking into unit tests."""
+    monkeypatch.setattr("agent.credential_pool._import_codex_cli_tokens", lambda: None)
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+
 def _write_auth_store(tmp_path, payload: dict) -> None:
     hermes_home = tmp_path / "hermes"
     hermes_home.mkdir(parents=True, exist_ok=True)
@@ -326,6 +333,109 @@ def test_mark_exhausted_and_rotate_persists_status(tmp_path, monkeypatch):
     persisted = auth_payload["credential_pool"]["anthropic"][0]
     assert persisted["last_status"] == "exhausted"
     assert persisted["last_error_code"] == 402
+
+
+def test_stale_pool_persist_preserves_new_codex_entries(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "TUAN",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "tok-1",
+                        "refresh_token": "ref-1",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "device_code",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "device_code",
+                        "access_token": "tok-2",
+                        "refresh_token": "ref-2",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    stale_pool = load_pool("openai-codex")
+    assert stale_pool.select().id == "cred-1"
+
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "TUAN",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "tok-1",
+                        "refresh_token": "ref-1",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "device_code",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "device_code",
+                        "access_token": "tok-2",
+                        "refresh_token": "ref-2",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                    },
+                    {
+                        "id": "cred-3",
+                        "label": "openai-codex-oauth-3",
+                        "auth_type": "oauth",
+                        "priority": 2,
+                        "source": "manual:device_code",
+                        "access_token": "tok-3",
+                        "refresh_token": "ref-3",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                    },
+                    {
+                        "id": "cred-4",
+                        "label": "openai-codex-oauth-4",
+                        "auth_type": "oauth",
+                        "priority": 3,
+                        "source": "manual:device_code",
+                        "access_token": "tok-4",
+                        "refresh_token": "ref-4",
+                        "base_url": "https://chatgpt.com/backend-api/codex",
+                    },
+                ]
+            },
+        },
+    )
+
+    next_entry = stale_pool.mark_exhausted_and_rotate(
+        status_code=429,
+        error_context={"message": "The usage limit has been reached", "reset_at": time.time() + 3600},
+    )
+
+    assert next_entry is not None
+    assert next_entry.id == "cred-2"
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    labels = [entry["label"] for entry in auth_payload["credential_pool"]["openai-codex"]]
+    assert labels == ["TUAN", "device_code", "openai-codex-oauth-3", "openai-codex-oauth-4"]
+    assert auth_payload["credential_pool"]["openai-codex"][0]["last_status"] == "exhausted"
 
 
 def test_try_refresh_current_updates_only_current_entry(tmp_path, monkeypatch):
@@ -701,6 +811,270 @@ def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
     assert entry is not None
     assert entry.id == "key-b"
     assert entry.access_token == "sk-or-light"
+
+
+def test_mark_used_increments_current_entry_and_persists(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "agent.credential_pool.get_pool_strategy",
+        lambda _provider: "least_used",
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_singletons",
+        lambda provider, entries: (False, set()),
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_env",
+        lambda provider, entries: (False, set()),
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "key-a",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-or-primary",
+                        "request_count": 0,
+                    },
+                    {
+                        "id": "key-b",
+                        "label": "secondary",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "sk-or-secondary",
+                        "request_count": 5,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    selected = pool.select()
+    assert selected is not None
+    assert selected.id == "key-a"
+
+    updated = pool.mark_used()
+
+    assert updated is not None
+    assert updated.id == "key-a"
+    assert updated.request_count == 1
+    assert pool.current().request_count == 1
+
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["openrouter"][0]
+    assert persisted["request_count"] == 1
+
+
+def test_mark_used_can_target_specific_entry_without_current_selection(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "agent.credential_pool.get_pool_strategy",
+        lambda _provider: "least_used",
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_singletons",
+        lambda provider, entries: (False, set()),
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_env",
+        lambda provider, entries: (False, set()),
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "key-a",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-or-primary",
+                        "request_count": 3,
+                    },
+                    {
+                        "id": "key-b",
+                        "label": "secondary",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "sk-or-secondary",
+                        "request_count": 1,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    updated = pool.mark_used("key-b")
+
+    assert updated is not None
+    assert updated.id == "key-b"
+    assert updated.request_count == 2
+    assert pool.current() is None
+
+
+def test_select_for_request_reselects_least_used_after_live_mark_used(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr(
+        "agent.credential_pool.get_pool_strategy",
+        lambda _provider: "least_used",
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_singletons",
+        lambda provider, entries: (False, set()),
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool._seed_from_env",
+        lambda provider, entries: (False, set()),
+    )
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "key-a",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-or-primary",
+                        "request_count": 0,
+                    },
+                    {
+                        "id": "key-b",
+                        "label": "secondary",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "sk-or-secondary",
+                        "request_count": 0,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    first = pool.select_for_request()
+    assert first is not None
+    assert first.id == "key-a"
+
+    pool.mark_used(first.id)
+    second = pool.select_for_request()
+
+    assert second is not None
+    assert second.id == "key-b"
+
+
+def test_select_for_request_fill_first_reverts_to_primary_after_cooldown(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "key-a",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "***",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time() - 4000,
+                        "last_error_code": 429,
+                    },
+                    {
+                        "id": "key-b",
+                        "label": "secondary",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "***",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    selected = pool.select_for_request()
+
+    assert selected is not None
+    assert selected.id == "key-a"
+
+
+def test_relative_reset_window_persists_for_usage_limit_errors(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "token-a",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "secondary",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": "token-b",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    first = pool.select()
+    assert first is not None
+    assert first.id == "cred-1"
+
+    next_entry = pool.mark_exhausted_and_rotate(
+        status_code=429,
+        error_context={"type": "usage_limit_reached", "resets_in_seconds": 6578},
+    )
+    assert next_entry is not None
+    assert next_entry.id == "cred-2"
+
+    reloaded = load_pool("openai-codex")
+    entries = {entry.id: entry for entry in reloaded.entries()}
+    assert entries["cred-1"].last_error_reset_at is not None
+    assert entries["cred-1"].last_error_reset_at > time.time() + 6500
+
 
 
 def test_thread_safety_concurrent_select(tmp_path, monkeypatch):

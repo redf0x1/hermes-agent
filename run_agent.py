@@ -2691,12 +2691,21 @@ class AIAgent:
         if isinstance(body, dict):
             payload = body.get("error") if isinstance(body.get("error"), dict) else body
         if isinstance(payload, dict):
-            reason = payload.get("code") or payload.get("error")
+            error_type = payload.get("type")
+            if isinstance(error_type, str) and error_type.strip():
+                context["type"] = error_type.strip()
+            reason = payload.get("code") or payload.get("error") or error_type
             if isinstance(reason, str) and reason.strip():
                 context["reason"] = reason.strip()
             message = payload.get("message") or payload.get("error_description")
             if isinstance(message, str) and message.strip():
                 context["message"] = message.strip()
+            resets_in_seconds = payload.get("resets_in_seconds")
+            if resets_in_seconds not in (None, ""):
+                try:
+                    context["resets_in_seconds"] = int(float(resets_in_seconds))
+                except (TypeError, ValueError):
+                    pass
             for key in ("resets_at", "reset_at"):
                 value = payload.get(key)
                 if value not in (None, ""):
@@ -2745,6 +2754,73 @@ class AIAgent:
                         context["reset_at"] = time.time() + float(sec_match.group(1))
 
         return context
+
+    @staticmethod
+    def _is_usage_limit_reached(error_context: Optional[Dict[str, Any]]) -> bool:
+        if not isinstance(error_context, dict):
+            return False
+        for key in ("type", "reason"):
+            value = error_context.get(key)
+            if isinstance(value, str) and value.strip().lower() == "usage_limit_reached":
+                return True
+        return False
+
+    @staticmethod
+    def _reset_seconds_from_error_context(error_context: Optional[Dict[str, Any]]) -> Optional[int]:
+        if not isinstance(error_context, dict):
+            return None
+
+        resets_in_seconds = error_context.get("resets_in_seconds")
+        if resets_in_seconds not in (None, ""):
+            try:
+                return max(0, int(float(resets_in_seconds)))
+            except (TypeError, ValueError):
+                pass
+
+        reset_at = error_context.get("reset_at")
+        if reset_at in (None, ""):
+            return None
+
+        reset_ts: Optional[float] = None
+        if isinstance(reset_at, (int, float)):
+            reset_ts = float(reset_at)
+        elif isinstance(reset_at, str):
+            raw = reset_at.strip()
+            if raw:
+                try:
+                    reset_ts = float(raw)
+                except ValueError:
+                    try:
+                        reset_ts = datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+                    except ValueError:
+                        reset_ts = None
+
+        if reset_ts is None:
+            return None
+        if reset_ts > 1_000_000_000_000:
+            reset_ts /= 1000.0
+        return max(0, int(round(reset_ts - time.time())))
+
+    @classmethod
+    def _format_reset_hint(cls, error_context: Optional[Dict[str, Any]]) -> str:
+        seconds = cls._reset_seconds_from_error_context(error_context)
+        if seconds is None:
+            return ""
+        if seconds < 60:
+            return f" (reset in ~{seconds}s)"
+        minutes, secs = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        days, hours = divmod(hours, 24)
+        parts = []
+        if days:
+            parts.append(f"{days}d")
+        if hours:
+            parts.append(f"{hours}h")
+        if minutes:
+            parts.append(f"{minutes}m")
+        if not parts:
+            parts.append(f"{secs}s")
+        return f" (reset in ~{' '.join(parts)})"
 
     def _usage_summary_for_api_request_hook(self, response: Any) -> Optional[Dict[str, Any]]:
         """Token buckets for ``post_api_request`` plugins (no raw ``response`` object)."""
@@ -4253,6 +4329,7 @@ class AIAgent:
         return True
 
     def _ensure_primary_openai_client(self, *, reason: str) -> Any:
+        self._prepare_primary_credential_for_request()
         with self._openai_client_lock():
             client = getattr(self, "client", None)
             if client is not None and not self._is_openai_client_closed(client):
@@ -4672,6 +4749,34 @@ class AIAgent:
         else:
             self._client_kwargs.pop("default_headers", None)
 
+    def _prepare_primary_credential_for_request(self):
+        if getattr(self, "_fallback_activated", False):
+            return None
+        pool = getattr(self, "_credential_pool", None)
+        if pool is None or not hasattr(pool, "select_for_request"):
+            return None
+        entry = pool.select_for_request()
+        if entry is None:
+            return None
+        runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
+        runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
+        current_base = self.base_url.rstrip("/") if isinstance(self.base_url, str) else self.base_url
+        next_base = runtime_base.rstrip("/") if isinstance(runtime_base, str) else runtime_base
+        if runtime_key != self.api_key or next_base != current_base:
+            self._swap_credential(entry)
+        return entry
+
+    def _mark_primary_pool_used(self) -> None:
+        if getattr(self, "_fallback_activated", False):
+            return
+        pool = getattr(self, "_credential_pool", None)
+        if pool is None or not hasattr(pool, "mark_used"):
+            return
+        try:
+            pool.mark_used()
+        except Exception:
+            logger.debug("Failed to mark primary pooled credential used", exc_info=True)
+
     def _swap_credential(self, entry) -> None:
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
@@ -4748,6 +4853,21 @@ class AIAgent:
             return False, has_retried_429
 
         if effective_reason == FailoverReason.rate_limit:
+            if self._is_usage_limit_reached(error_context):
+                rotate_status = status_code if status_code is not None else 429
+                next_entry = pool.mark_exhausted_and_rotate(status_code=rotate_status, error_context=error_context)
+                if next_entry is not None:
+                    self._emit_status(
+                        f"⚠️ Usage limit reached{self._format_reset_hint(error_context)} — rotating to next credential..."
+                    )
+                    logger.info(
+                        "Credential %s (usage_limit_reached) — rotated to pool entry %s",
+                        rotate_status,
+                        getattr(next_entry, "id", "?"),
+                    )
+                    self._swap_credential(next_entry)
+                    return True, False
+                return False, False
             if not has_retried_429:
                 return False, True
             rotate_status = status_code if status_code is not None else 429
@@ -4785,6 +4905,7 @@ class AIAgent:
 
     def _anthropic_messages_create(self, api_kwargs: dict):
         if self.api_mode == "anthropic_messages":
+            self._prepare_primary_credential_for_request()
             self._try_refresh_anthropic_client_credentials()
         return self._anthropic_client.messages.create(**api_kwargs)
 
@@ -8940,6 +9061,7 @@ class AIAgent:
                             if not self.quiet_mode:
                                 self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
                     
+                    self._mark_primary_pool_used()
                     has_retried_429 = False  # Reset on success
                     self._touch_activity(f"API call #{api_call_count} completed")
                     break  # Success, exit retry loop
@@ -9327,6 +9449,26 @@ class AIAgent:
                                 compression_attempts = 0
                                 primary_recovery_attempted = False
                                 continue
+
+                    if is_rate_limited and self._is_usage_limit_reached(error_context):
+                        pool = self._credential_pool
+                        pool_may_recover = pool is not None and pool.has_available()
+                        if not pool_may_recover:
+                            _reset_hint = self._format_reset_hint(error_context)
+                            _usage_msg = (
+                                f"Usage limit reached{_reset_hint}. "
+                                "No alternate credential/provider is currently available."
+                            )
+                            self._emit_status(f"❌ {_usage_msg}")
+                            self._persist_session(messages, conversation_history)
+                            return {
+                                "final_response": _usage_msg,
+                                "messages": messages,
+                                "api_calls": api_call_count,
+                                "completed": False,
+                                "failed": True,
+                                "error": _usage_msg,
+                            }
 
                     is_payload_too_large = (
                         classified.reason == FailoverReason.payload_too_large

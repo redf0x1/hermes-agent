@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +22,7 @@ from agent.auxiliary_client import (
     _is_payment_error,
     _try_payment_fallback,
     _resolve_auto,
+    _try_anthropic,
 )
 
 
@@ -33,6 +35,7 @@ def _clean_env(monkeypatch):
         "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
     ):
         monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
 
 
 @pytest.fixture
@@ -146,7 +149,8 @@ class TestReadCodexAccessToken:
             },
         }))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-        result = _read_codex_access_token()
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(False, None)):
+            result = _read_codex_access_token()
         assert result is None, "Expired JWT should return None"
 
     def test_valid_jwt_returns_token(self, tmp_path, monkeypatch):
@@ -1466,6 +1470,159 @@ class TestAsyncCallLlmFallback:
 
         assert result is fb_response
         mock_fb.assert_called_once_with("auto", "compression", reason="connection error")
+
+
+class TestCallLlmDynamicPoolStrategies:
+    @staticmethod
+    def _response(content="ok"):
+        message = MagicMock()
+        message.content = content
+        choice = MagicMock()
+        choice.message = message
+        return MagicMock(choices=[choice])
+
+    def test_call_llm_dynamic_pool_bypasses_cache_and_marks_used(self):
+        pool = MagicMock()
+        pool.has_credentials.return_value = True
+        pool.uses_dynamic_strategy.return_value = True
+
+        client = MagicMock()
+        response = self._response()
+        client.chat.completions.create.return_value = response
+
+        with patch("agent.auxiliary_client.load_pool", return_value=pool),              patch("agent.auxiliary_client._resolve_task_provider_model",
+                    return_value=("openai-codex", "gpt-5.2-codex", None, None, None)),              patch("agent.auxiliary_client._get_cached_client",
+                    side_effect=AssertionError("cache should not be used for dynamic pool providers")),              patch("agent.auxiliary_client.resolve_provider_client",
+                    return_value=(client, "gpt-5.2-codex")):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result is response
+        pool.mark_used.assert_called_once_with()
+
+    def test_call_llm_dynamic_pool_persists_selected_entry_usage(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        (hermes_home / "auth.json").write_text(json.dumps({
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "key-a",
+                        "label": "primary",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-or-primary",
+                        "request_count": 0,
+                    },
+                    {
+                        "id": "key-b",
+                        "label": "secondary",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "manual",
+                        "access_token": "sk-or-secondary",
+                        "request_count": 0,
+                    },
+                ]
+            },
+        }, indent=2))
+        (hermes_home / "config.yaml").write_text(
+            "credential_pool_strategies:\n  openrouter: least_used\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+        response = self._response()
+        first_client = MagicMock()
+        first_client.chat.completions.create.return_value = response
+        second_client = MagicMock()
+        second_client.chat.completions.create.return_value = response
+
+        with patch("agent.auxiliary_client.OpenAI", side_effect=[first_client, second_client]) as mock_openai:
+            first = call_llm(
+                provider="openrouter",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+            second = call_llm(
+                provider="openrouter",
+                messages=[{"role": "user", "content": "again"}],
+            )
+
+        assert first is response
+        assert second is response
+        assert mock_openai.call_args_list[0].kwargs["api_key"] == "sk-or-primary"
+        assert mock_openai.call_args_list[1].kwargs["api_key"] == "sk-or-secondary"
+
+        payload = json.loads((hermes_home / "auth.json").read_text())
+        counts = {entry["id"]: entry["request_count"] for entry in payload["credential_pool"]["openrouter"]}
+        assert counts["key-a"] == 1
+        assert counts["key-b"] == 1
+
+    def test_try_anthropic_attaches_pool_metadata(self):
+        entry = SimpleNamespace(
+            id="anthropic-1",
+            access_token="oauth-token",
+            base_url="https://api.anthropic.com",
+        )
+        real_client = MagicMock()
+
+        with patch("agent.auxiliary_client._select_pool_entry", return_value=(True, entry)),              patch("agent.anthropic_adapter.build_anthropic_client", return_value=real_client):
+            client, model = _try_anthropic()
+
+        assert client is not None
+        assert model is not None
+        assert getattr(client, "_hermes_pool_provider") == "anthropic"
+        assert getattr(client, "_hermes_pool_entry_id") == "anthropic-1"
+
+    def test_call_llm_auto_bypasses_cache_for_dynamic_anthropic_pool(self):
+        pool = MagicMock()
+        pool.has_credentials.return_value = True
+        pool.uses_dynamic_strategy.return_value = True
+        client = MagicMock()
+        response = self._response()
+        client.chat.completions.create.return_value = response
+
+        def _load_pool(provider):
+            return pool if provider == "anthropic" else None
+
+        with patch("agent.auxiliary_client.load_pool", side_effect=_load_pool),              patch("agent.auxiliary_client._resolve_task_provider_model",
+                    return_value=("auto", None, None, None, None)),              patch("agent.auxiliary_client._get_cached_client",
+                    side_effect=AssertionError("cache should not be used when auto can hit a dynamic pool backend")),              patch("agent.auxiliary_client.resolve_provider_client",
+                    return_value=(client, "claude-haiku-4-5-20251001")):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result is response
+
+    @pytest.mark.asyncio
+    async def test_async_call_llm_dynamic_pool_bypasses_cache_and_marks_used(self):
+        pool = MagicMock()
+        pool.has_credentials.return_value = True
+        pool.uses_dynamic_strategy.return_value = True
+
+        client = MagicMock()
+        response = self._response()
+        client.chat.completions.create = AsyncMock(return_value=response)
+
+        with patch("agent.auxiliary_client.load_pool", return_value=pool),              patch("agent.auxiliary_client._resolve_task_provider_model",
+                    return_value=("openai-codex", "gpt-5.2-codex", None, None, None)),              patch("agent.auxiliary_client._get_cached_client",
+                    side_effect=AssertionError("cache should not be used for dynamic pool providers")),              patch("agent.auxiliary_client.resolve_provider_client",
+                    return_value=(client, "gpt-5.2-codex")):
+            result = await async_call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "hello"}],
+            )
+
+        assert result is response
+        pool.mark_used.assert_called_once_with()
+
+
 class TestStaleBaseUrlWarning:
     """_resolve_auto() warns when OPENAI_BASE_URL conflicts with config provider (#5161)."""
 
