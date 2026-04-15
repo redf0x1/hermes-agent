@@ -4,6 +4,7 @@ import json
 import time
 import base64
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -21,9 +22,14 @@ from hermes_cli.auth import (
     resolve_codex_runtime_credentials,
     resolve_provider,
 )
+from hermes_cli.model_switch import list_authenticated_providers
 
 
-def _setup_hermes_auth(hermes_home: Path, *, access_token: str = "access", refresh_token: str = "refresh"):
+VALID_ACCESS_TOKEN = "plain-token-abcdefghijklmnopqrstuvwxyz0123456789"
+VALID_REFRESH_TOKEN = "refresh-token-abcdefghijklmnopqrstuvwxyz0123456789"
+
+
+def _setup_hermes_auth(hermes_home: Path, *, access_token: str = VALID_ACCESS_TOKEN, refresh_token: str = VALID_REFRESH_TOKEN):
     """Write Codex tokens into the Hermes auth store."""
     hermes_home.mkdir(parents=True, exist_ok=True)
     auth_store = {
@@ -57,8 +63,18 @@ def test_read_codex_tokens_success(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
     data = _read_codex_tokens()
-    assert data["tokens"]["access_token"] == "access"
-    assert data["tokens"]["refresh_token"] == "refresh"
+    assert data["tokens"]["access_token"] == VALID_ACCESS_TOKEN
+    assert data["tokens"]["refresh_token"] == VALID_REFRESH_TOKEN
+
+
+def test_read_codex_tokens_rejects_placeholder_tokens(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home, access_token="access-new", refresh_token="refresh-new")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    with pytest.raises(AuthError) as exc:
+        _read_codex_tokens()
+    assert exc.value.code == "codex_auth_invalid_access_token"
 
 
 def test_read_codex_tokens_missing(tmp_path, monkeypatch):
@@ -87,7 +103,7 @@ def test_resolve_codex_runtime_credentials_missing_access_token(tmp_path, monkey
 def test_resolve_codex_runtime_credentials_refreshes_expiring_token(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
     expiring_token = _jwt_with_exp(int(time.time()) - 10)
-    _setup_hermes_auth(hermes_home, access_token=expiring_token, refresh_token="refresh-old")
+    _setup_hermes_auth(hermes_home, access_token=expiring_token, refresh_token="refresh-old-abcdefghijklmnopqrstuvwxyz0123456789")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
     called = {"count": 0}
@@ -106,7 +122,7 @@ def test_resolve_codex_runtime_credentials_refreshes_expiring_token(tmp_path, mo
 
 def test_resolve_codex_runtime_credentials_force_refresh(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
-    _setup_hermes_auth(hermes_home, access_token="access-current", refresh_token="refresh-old")
+    _setup_hermes_auth(hermes_home, access_token="access-current-abcdefghijklmnopqrstuvwxyz0123456789", refresh_token="refresh-old-abcdefghijklmnopqrstuvwxyz0123456789")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
     called = {"count": 0}
@@ -135,25 +151,39 @@ def test_save_codex_tokens_roundtrip(tmp_path, monkeypatch):
     (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
-    _save_codex_tokens({"access_token": "at123", "refresh_token": "rt456"})
+    _save_codex_tokens({"access_token": "hermes-at-abcdefghijklmnopqrstuvwxyz0123456789", "refresh_token": "hermes-rt-abcdefghijklmnopqrstuvwxyz0123456789"})
     data = _read_codex_tokens()
 
-    assert data["tokens"]["access_token"] == "at123"
-    assert data["tokens"]["refresh_token"] == "rt456"
+    assert data["tokens"]["access_token"] == "at123-abcdefghijklmnopqrstuvwxyz0123456789"
+    assert data["tokens"]["refresh_token"] == "rt456-abcdefghijklmnopqrstuvwxyz0123456789"
 
 
 def test_import_codex_cli_tokens(tmp_path, monkeypatch):
     codex_home = tmp_path / "codex-cli"
     codex_home.mkdir(parents=True, exist_ok=True)
     (codex_home / "auth.json").write_text(json.dumps({
-        "tokens": {"access_token": "cli-at", "refresh_token": "cli-rt"},
+        "tokens": {
+            "access_token": "cli-access-token-abcdefghijklmnopqrstuvwxyz0123456789",
+            "refresh_token": "cli-refresh-token-abcdefghijklmnopqrstuvwxyz0123456789",
+        },
     }))
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
     tokens = _import_codex_cli_tokens()
     assert tokens is not None
-    assert tokens["access_token"] == "cli-at"
-    assert tokens["refresh_token"] == "cli-rt"
+    assert tokens["access_token"] == "cli-access-token-abcdefghijklmnopqrstuvwxyz0123456789"
+    assert tokens["refresh_token"] == "cli-refresh-token-abcdefghijklmnopqrstuvwxyz0123456789"
+
+
+def test_import_codex_cli_tokens_ignores_placeholder_tokens(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex-cli"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "auth.json").write_text(json.dumps({
+        "tokens": {"access_token": "access-new", "refresh_token": "refresh-new"},
+    }))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    assert _import_codex_cli_tokens() is None
 
 
 def test_import_codex_cli_tokens_missing(tmp_path, monkeypatch):
@@ -172,14 +202,14 @@ def test_codex_tokens_not_written_to_shared_file(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
 
-    _save_codex_tokens({"access_token": "hermes-at", "refresh_token": "hermes-rt"})
+    _save_codex_tokens({"access_token": "hermes-at-abcdefghijklmnopqrstuvwxyz0123456789", "refresh_token": "hermes-rt-abcdefghijklmnopqrstuvwxyz0123456789"})
 
     # ~/.codex/auth.json should NOT exist — _save_codex_tokens only touches Hermes store
     assert not (codex_home / "auth.json").exists()
 
     # Hermes auth store should have the tokens
     data = _read_codex_tokens()
-    assert data["tokens"]["access_token"] == "hermes-at"
+    assert data["tokens"]["access_token"] == "hermes-at-abcdefghijklmnopqrstuvwxyz0123456789"
 
 
 def test_write_codex_cli_tokens_creates_file(tmp_path, monkeypatch):
@@ -283,3 +313,46 @@ def test_resolve_returns_hermes_auth_store_source(tmp_path, monkeypatch):
     assert creds["source"] == "hermes-auth-store"
     assert creds["provider"] == "openai-codex"
     assert creds["base_url"] == DEFAULT_CODEX_BASE_URL
+
+
+def test_get_codex_auth_status_ignores_unusable_pool_entry(monkeypatch):
+    invalid_entry = SimpleNamespace(
+        runtime_api_key="access-new",
+        access_token="access-new",
+        last_refresh="2026-04-15T00:00:00Z",
+        label="stale-singleton",
+    )
+
+    class _FakePool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return invalid_entry
+
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: _FakePool())
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_codex_runtime_credentials",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AuthError(
+                "Codex auth contains an unusable access_token. Run `hermes auth` to re-authenticate.",
+                provider="openai-codex",
+                code="codex_auth_invalid_access_token",
+                relogin_required=True,
+            )
+        ),
+    )
+
+    status = get_codex_auth_status()
+    assert status["logged_in"] is False
+    assert "unusable access_token" in status["error"]
+
+
+def test_list_authenticated_providers_skips_invalid_codex_status(monkeypatch):
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", lambda: {})
+    monkeypatch.setattr("hermes_cli.auth.get_codex_auth_status", lambda: {"logged_in": False})
+    monkeypatch.setattr("hermes_cli.auth._load_auth_store", lambda: {})
+
+    providers = list_authenticated_providers(current_provider="openrouter")
+
+    assert all(provider["slug"] != "openai-codex" for provider in providers)

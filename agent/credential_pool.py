@@ -1336,11 +1336,17 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # store has no tokens.  This mirrors resolve_codex_runtime_credentials()
         # so that load_pool() and list_authenticated_providers() detect tokens
         # that only exist in the Codex CLI shared file.
-        if not (isinstance(tokens, dict) and tokens.get("access_token")):
+        try:
+            from hermes_cli.auth import _import_codex_cli_tokens, _save_codex_tokens, _codex_token_pair_looks_usable
+        except Exception:
+            _import_codex_cli_tokens = None
+            _save_codex_tokens = None
+            _codex_token_pair_looks_usable = None
+        tokens_usable = bool(_codex_token_pair_looks_usable(tokens)) if _codex_token_pair_looks_usable else bool(isinstance(tokens, dict) and tokens.get("access_token"))
+        if not tokens_usable:
             try:
-                from hermes_cli.auth import _import_codex_cli_tokens, _save_codex_tokens
                 cli_tokens = _import_codex_cli_tokens()
-                if cli_tokens:
+                if cli_tokens and _save_codex_tokens:
                     logger.info("Importing Codex CLI tokens into Hermes auth store.")
                     _save_codex_tokens(cli_tokens)
                     # Re-read state after import
@@ -1349,7 +1355,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                     tokens = state.get("tokens") if isinstance(state, dict) else None
             except Exception as exc:
                 logger.debug("Codex CLI token import failed: %s", exc)
-        if isinstance(tokens, dict) and tokens.get("access_token"):
+        if (bool(_codex_token_pair_looks_usable(tokens)) if _codex_token_pair_looks_usable else bool(isinstance(tokens, dict) and tokens.get("access_token"))):
             active_sources.add("device_code")
             changed |= _upsert_entry(
                 entries,
@@ -1442,7 +1448,7 @@ def _prune_stale_seeded_entries(entries: List[PooledCredential], active_sources:
         or entry.source in active_sources
         or not (
             entry.source.startswith("env:")
-            or entry.source in {"claude_code", "hermes_pkce"}
+            or entry.source in {"claude_code", "hermes_pkce", "device_code"}
         )
     ]
     if len(retained) == len(entries):

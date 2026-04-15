@@ -873,6 +873,12 @@ def list_authenticated_providers(
         # This applies to OAuth providers AND api_key providers that also
         # support OAuth (e.g. anthropic supports both API key and Claude Code
         # OAuth via external credential files).
+        if not has_creds and hermes_slug == "openai-codex":
+            try:
+                from hermes_cli.auth import get_codex_auth_status
+                has_creds = bool(get_codex_auth_status().get("logged_in"))
+            except Exception as exc:
+                logger.debug("Codex auth status check failed for %s: %s", pid, exc)
         if not has_creds:
             try:
                 from hermes_cli.auth import _load_auth_store
@@ -890,7 +896,7 @@ def list_authenticated_providers(
         # This catches credentials that exist in external stores (e.g.
         # Codex CLI ~/.codex/auth.json) which _seed_from_singletons()
         # imports on demand but aren't in the raw auth.json yet.
-        if not has_creds:
+        if not has_creds and hermes_slug != "openai-codex":
             try:
                 from agent.credential_pool import load_pool
                 pool = load_pool(hermes_slug)
@@ -957,6 +963,12 @@ def list_authenticated_providers(
         if _cp_config and _cp_config.api_key_env_vars:
             _cp_has_creds = any(os.environ.get(ev) for ev in _cp_config.api_key_env_vars)
         # Also check auth store and credential pool
+        if not _cp_has_creds and _cp.slug == "openai-codex":
+            try:
+                from hermes_cli.auth import get_codex_auth_status
+                _cp_has_creds = bool(get_codex_auth_status().get("logged_in"))
+            except Exception:
+                pass
         if not _cp_has_creds:
             try:
                 from hermes_cli.auth import _load_auth_store
@@ -970,7 +982,7 @@ def list_authenticated_providers(
                     _cp_has_creds = True
             except Exception:
                 pass
-        if not _cp_has_creds:
+        if not _cp_has_creds and _cp.slug != "openai-codex":
             try:
                 from agent.credential_pool import load_pool
                 _cp_pool = load_pool(_cp.slug)
