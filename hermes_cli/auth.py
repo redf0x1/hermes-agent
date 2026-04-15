@@ -2390,14 +2390,15 @@ def get_codex_auth_status() -> Dict[str, Any]:
 
     # Fall back to legacy provider state
     try:
-        creds = resolve_codex_runtime_credentials()
+        data = _read_codex_tokens()
+        tokens = dict(data.get("tokens") or {})
         return {
             "logged_in": True,
             "auth_store": str(_auth_file_path()),
-            "last_refresh": creds.get("last_refresh"),
-            "auth_mode": creds.get("auth_mode"),
-            "source": creds.get("source"),
-            "api_key": creds.get("api_key"),
+            "last_refresh": data.get("last_refresh"),
+            "auth_mode": "chatgpt",
+            "source": "hermes-auth-store",
+            "api_key": str(tokens.get("access_token", "") or "").strip(),
         }
     except AuthError as exc:
         return {

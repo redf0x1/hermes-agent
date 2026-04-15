@@ -317,7 +317,15 @@ def test_resolve_returns_hermes_auth_store_source(tmp_path, monkeypatch):
     assert creds["base_url"] == DEFAULT_CODEX_BASE_URL
 
 
-def test_get_codex_auth_status_ignores_unusable_pool_entry(monkeypatch):
+def test_get_codex_auth_status_ignores_unusable_pool_entry(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(
+        hermes_home,
+        access_token="access-new",
+        refresh_token="refresh-old-abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
     invalid_entry = SimpleNamespace(
         runtime_api_key="access-new",
         access_token="access-new",
@@ -333,17 +341,6 @@ def test_get_codex_auth_status_ignores_unusable_pool_entry(monkeypatch):
             return invalid_entry
 
     monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: _FakePool())
-    monkeypatch.setattr(
-        "hermes_cli.auth.resolve_codex_runtime_credentials",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AuthError(
-                "Codex auth contains an unusable access_token. Run `hermes auth` to re-authenticate.",
-                provider="openai-codex",
-                code="codex_auth_invalid_access_token",
-                relogin_required=True,
-            )
-        ),
-    )
 
     status = get_codex_auth_status()
     assert status["logged_in"] is False
@@ -358,3 +355,67 @@ def test_list_authenticated_providers_skips_invalid_codex_status(monkeypatch):
     providers = list_authenticated_providers(current_provider="openrouter")
 
     assert all(provider["slug"] != "openai-codex" for provider in providers)
+
+
+def test_get_codex_auth_status_is_passive_for_legacy_auth_store(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    expired_token = _jwt_with_exp(int(time.time()) - 10)
+    _setup_hermes_auth(
+        hermes_home,
+        access_token=expired_token,
+        refresh_token="refresh-old-abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: None)
+
+    refresh_calls = []
+
+    def _fake_refresh(tokens, timeout_seconds):
+        refresh_calls.append((tokens, timeout_seconds))
+        return {
+            "access_token": "refreshed-access-token-abcdefghijklmnopqrstuvwxyz0123456789",
+            "refresh_token": "refreshed-refresh-token-abcdefghijklmnopqrstuvwxyz0123456789",
+            "last_refresh": "2026-04-15T00:00:00Z",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+
+    status = get_codex_auth_status()
+
+    assert refresh_calls == []
+    assert status["logged_in"] is True
+    assert status["source"] == "hermes-auth-store"
+    assert status["auth_mode"] == "chatgpt"
+    assert status["last_refresh"] == "2026-02-26T00:00:00Z"
+    assert status["api_key"] == expired_token
+
+
+def test_resolve_provider_auto_is_passive_for_legacy_codex_auth_store(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    expired_token = _jwt_with_exp(int(time.time()) - 10)
+    _setup_hermes_auth(
+        hermes_home,
+        access_token=expired_token,
+        refresh_token="refresh-old-abcdefghijklmnopqrstuvwxyz0123456789",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: None)
+
+    refresh_calls = []
+
+    def _fake_refresh(tokens, timeout_seconds):
+        refresh_calls.append((tokens, timeout_seconds))
+        return {
+            "access_token": "refreshed-access-token-abcdefghijklmnopqrstuvwxyz0123456789",
+            "refresh_token": "refreshed-refresh-token-abcdefghijklmnopqrstuvwxyz0123456789",
+            "last_refresh": "2026-04-15T00:00:00Z",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth._refresh_codex_auth_tokens", _fake_refresh)
+
+    provider = resolve_provider("auto")
+
+    assert refresh_calls == []
+    assert provider == "openai-codex"
