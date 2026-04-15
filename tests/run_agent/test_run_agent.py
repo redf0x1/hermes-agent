@@ -2922,6 +2922,108 @@ class TestCredentialPoolRecovery:
         agent._try_activate_fallback.assert_called_once_with()
         mock_sleep.assert_not_called()
 
+    def test_run_conversation_usage_limit_ignores_stale_pool_availability_without_alternative(self, agent):
+        class _UsageLimitError(Exception):
+            status_code = 429
+
+            def __init__(self):
+                self.body = {
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "The usage limit has been reached",
+                        "resets_in_seconds": 6578,
+                        "resets_at": 1776227745,
+                    }
+                }
+                self.response = SimpleNamespace(headers={})
+
+            def __str__(self):
+                return "HTTP 429: The usage limit has been reached"
+
+        calls = {"count": 0}
+
+        def _fake_api_call(api_kwargs):
+            calls["count"] += 1
+            raise _UsageLimitError()
+
+        pool = MagicMock()
+        pool.mark_exhausted_and_rotate.return_value = None
+        pool.has_available.return_value = True
+
+        agent._credential_pool = pool
+        agent._interruptible_api_call = _fake_api_call
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        agent._save_session_log = lambda *args, **kwargs: None
+        agent._fallback_chain = []
+        agent._fallback_index = 0
+        agent._try_activate_fallback = MagicMock(return_value=False)
+
+        with (
+            patch("run_agent.time.sleep", return_value=None) as mock_sleep,
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert calls["count"] == 1
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert "usage limit" in result["error"].lower()
+        assert "alternate credential/provider" in result["error"].lower()
+        mock_sleep.assert_not_called()
+
+    def test_run_conversation_usage_limit_ignores_stale_pool_availability_and_falls_back(self, agent):
+        class _UsageLimitError(Exception):
+            status_code = 429
+
+            def __init__(self):
+                self.body = {
+                    "error": {
+                        "type": "usage_limit_reached",
+                        "message": "The usage limit has been reached",
+                        "resets_in_seconds": 6578,
+                    }
+                }
+                self.response = SimpleNamespace(headers={})
+
+            def __str__(self):
+                return "HTTP 429: The usage limit has been reached"
+
+        responses = [_UsageLimitError(), _mock_response(content="Recovered via fallback")]
+        calls = {"count": 0}
+
+        def _fake_api_call(api_kwargs):
+            calls["count"] += 1
+            result = responses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+        pool = MagicMock()
+        pool.mark_exhausted_and_rotate.return_value = None
+        pool.has_available.return_value = True
+
+        agent._credential_pool = pool
+        agent._interruptible_api_call = _fake_api_call
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+        agent._save_session_log = lambda *args, **kwargs: None
+        agent._fallback_chain = [{"model": "fallback/model"}]
+        agent._fallback_index = 0
+        agent._try_activate_fallback = MagicMock(return_value=True)
+
+        with (
+            patch("run_agent.time.sleep", return_value=None) as mock_sleep,
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert calls["count"] == 2
+        assert result["completed"] is True
+        assert result["final_response"] == "Recovered via fallback"
+        agent._try_activate_fallback.assert_called_once_with()
+        mock_sleep.assert_not_called()
+
     def test_prepare_primary_credential_for_request_skips_fallback_runtime(self, agent):
         pool = MagicMock()
         agent._credential_pool = pool

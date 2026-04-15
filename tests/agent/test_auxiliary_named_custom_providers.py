@@ -108,14 +108,53 @@ class TestResolveProviderClientNamedCustom:
         _write_config(tmp_path, {
             "model": {"default": "test-model"},
             "custom_providers": [
-                {"name": "beans", "base_url": "http://beans.local/v1", "api_key": "k"},
+                {"name": "beans", "base_url": "http://beans.local/v1", "api_key": "***"},
             ],
         })
-        from agent.auxiliary_client import resolve_provider_client
-        client, model = resolve_provider_client("beans", "my-model")
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_client = MagicMock()
+            mock_openai.return_value = mock_client
+            from agent.auxiliary_client import resolve_provider_client
+            client, model = resolve_provider_client("beans", "my-model")
         assert client is not None
+        assert client is mock_client
         assert model == "my-model"
-        assert "beans.local" in str(client.base_url)
+        assert mock_openai.call_args.kwargs["base_url"] == "http://beans.local/v1"
+
+    def test_named_custom_provider_uses_pool_key_when_available(self, tmp_path):
+        _write_config(tmp_path, {
+            "model": {"default": "test-model"},
+            "custom_providers": [
+                {"name": "beans", "base_url": "http://beans.local/v1", "api_key": "***"},
+            ],
+        })
+
+        pool = MagicMock()
+        pool.has_credentials.return_value = True
+        entry = MagicMock()
+        entry.id = "bean-key-1"
+        entry.runtime_api_key = "pool-key"
+        entry.access_token = "pool-key"
+        entry.runtime_base_url = "http://beans.local/v1"
+        entry.base_url = "http://beans.local/v1"
+        pool.current.return_value = None
+        pool.select_for_request.return_value = entry
+
+        with (
+            patch("agent.auxiliary_client.load_pool", return_value=pool),
+            patch("agent.auxiliary_client.OpenAI") as mock_openai,
+        ):
+            mock_client = MagicMock()
+            mock_openai.return_value = mock_client
+            from agent.auxiliary_client import resolve_provider_client
+            client, model = resolve_provider_client("beans", "my-model")
+
+        assert client is mock_client
+        assert model == "my-model"
+        assert mock_openai.call_args.kwargs["api_key"] == "pool-key"
+        assert mock_openai.call_args.kwargs["base_url"] == "http://beans.local/v1"
+        assert getattr(client, "_hermes_pool_provider") == "custom:beans"
+        assert getattr(client, "_hermes_pool_entry_id") == "bean-key-1"
 
     def test_named_custom_provider_default_model(self, tmp_path):
         _write_config(tmp_path, {

@@ -45,7 +45,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from openai import OpenAI
 
-from agent.credential_pool import load_pool, list_custom_pool_providers
+from agent.credential_pool import load_pool, list_custom_pool_providers, get_custom_provider_pool_key
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
 
@@ -165,10 +165,21 @@ def _to_openai_base_url(base_url: str) -> str:
     return url
 
 
-def _load_provider_pool(provider: Optional[str]) -> Optional[Any]:
+def _load_provider_pool(provider: Optional[str], *, base_url: Optional[str] = None) -> Optional[Any]:
     normalized = str(provider or "").strip()
     if not normalized or normalized in {"auto", "custom"}:
-        return None
+        if base_url:
+            pool_key = get_custom_provider_pool_key(str(base_url).strip())
+            if pool_key:
+                normalized = pool_key
+            else:
+                return None
+        else:
+            return None
+    elif not normalized.startswith("custom:") and base_url:
+        pool_key = get_custom_provider_pool_key(str(base_url).strip())
+        if pool_key:
+            normalized = pool_key
     try:
         pool = load_pool(normalized)
     except Exception as exc:
@@ -204,11 +215,18 @@ def _auto_uses_dynamic_pool_strategy() -> bool:
     return any(_provider_uses_dynamic_pool_strategy(provider) for provider in candidates)
 
 
-def _attach_pool_metadata(client: Any, provider: Optional[str], credential_id: Optional[str]) -> Any:
-    if client is None or not provider or not credential_id:
+def _attach_pool_metadata(
+    client: Any,
+    provider: Optional[str],
+    credential_id: Optional[str],
+    *,
+    pool_provider: Optional[str] = None,
+) -> Any:
+    provider_value = pool_provider or provider
+    if client is None or not provider_value or not credential_id:
         return client
     try:
-        setattr(client, "_hermes_pool_provider", provider)
+        setattr(client, "_hermes_pool_provider", provider_value)
         setattr(client, "_hermes_pool_entry_id", credential_id)
     except Exception:
         pass
@@ -1583,11 +1601,31 @@ def resolve_provider_client(
                 custom_key = os.getenv(custom_key_env, "").strip()
             custom_key = custom_key or "no-key-required"
             if custom_base:
+                pool = _load_provider_pool(provider, base_url=custom_base)
+                entry = None
+                if pool is not None:
+                    try:
+                        entry = pool.select_for_request() if hasattr(pool, "select_for_request") else pool.select()
+                    except Exception as exc:
+                        logger.debug(
+                            "Auxiliary client: could not select named custom pool entry for %s: %s",
+                            provider,
+                            exc,
+                        )
+                    pooled_key = _pool_runtime_api_key(entry)
+                    if pooled_key:
+                        custom_key = pooled_key
                 final_model = _normalize_resolved_model(
                     model or custom_entry.get("model") or _read_main_model() or "gpt-4o-mini",
                     provider,
                 )
                 client = OpenAI(api_key=custom_key, base_url=custom_base)
+                _attach_pool_metadata(
+                    client,
+                    provider,
+                    getattr(entry, "id", None) if entry is not None else None,
+                    pool_provider=get_custom_provider_pool_key(custom_base),
+                )
                 client = _wrap_if_needed(client, final_model, custom_base)
                 logger.debug(
                     "resolve_provider_client: named custom provider %r (%s)",

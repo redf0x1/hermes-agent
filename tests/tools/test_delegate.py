@@ -702,7 +702,7 @@ class TestDelegationCredentialResolution(unittest.TestCase):
     def test_missing_config_keys_inherit_parent(self):
         """When config dict has no model/provider keys at all, inherits parent."""
         parent = _make_mock_parent(depth=0)
-        cfg = {"max_iterations": 45}
+        cfg = {"max_iterations": 50}
         creds = _resolve_delegation_credentials(cfg, parent)
         self.assertIsNone(creds["model"])
         self.assertIsNone(creds["provider"])
@@ -716,7 +716,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
     def test_config_provider_credentials_reach_child_agent(self, mock_creds, mock_cfg):
         """When delegation.provider is configured, child agent gets resolved credentials."""
         mock_cfg.return_value = {
-            "max_iterations": 45,
+            "max_iterations": 50,
             "model": "google/gemini-3-flash-preview",
             "provider": "openrouter",
         }
@@ -750,7 +750,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
     def test_cross_provider_delegation(self, mock_creds, mock_cfg):
         """Parent on Nous, subagent on OpenRouter — full credential switch."""
         mock_cfg.return_value = {
-            "max_iterations": 45,
+            "max_iterations": 50,
             "model": "google/gemini-3-flash-preview",
             "provider": "openrouter",
         }
@@ -787,16 +787,16 @@ class TestDelegationProviderIntegration(unittest.TestCase):
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     def test_direct_endpoint_credentials_reach_child_agent(self, mock_creds, mock_cfg):
         mock_cfg.return_value = {
-            "max_iterations": 45,
+            "max_iterations": 50,
             "model": "qwen2.5-coder",
             "base_url": "http://localhost:1234/v1",
-            "api_key": "local-key",
+            "api_key": "***",
         }
         mock_creds.return_value = {
             "model": "qwen2.5-coder",
             "provider": "custom",
             "base_url": "http://localhost:1234/v1",
-            "api_key": "local-key",
+            "api_key": "***",
             "api_mode": "chat_completions",
         }
         parent = _make_mock_parent(depth=0)
@@ -814,14 +814,14 @@ class TestDelegationProviderIntegration(unittest.TestCase):
             self.assertEqual(kwargs["model"], "qwen2.5-coder")
             self.assertEqual(kwargs["provider"], "custom")
             self.assertEqual(kwargs["base_url"], "http://localhost:1234/v1")
-            self.assertEqual(kwargs["api_key"], "local-key")
+            self.assertEqual(kwargs["api_key"], "***")
             self.assertEqual(kwargs["api_mode"], "chat_completions")
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     def test_empty_config_inherits_parent(self, mock_creds, mock_cfg):
         """When delegation config is empty, child inherits parent credentials."""
-        mock_cfg.return_value = {"max_iterations": 45, "model": "", "provider": ""}
+        mock_cfg.return_value = {"max_iterations": 50, "model": "", "provider": ""}
         mock_creds.return_value = {
             "model": None,
             "provider": None,
@@ -865,7 +865,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
     def test_batch_mode_all_children_get_credentials(self, mock_creds, mock_cfg):
         """In batch mode, all children receive the resolved credentials."""
         mock_cfg.return_value = {
-            "max_iterations": 45,
+            "max_iterations": 50,
             "model": "meta-llama/llama-4-scout",
             "provider": "openrouter",
         }
@@ -905,7 +905,7 @@ class TestDelegationProviderIntegration(unittest.TestCase):
     def test_model_only_no_provider_inherits_parent_credentials(self, mock_creds, mock_cfg):
         """Setting only model (no provider) changes model but keeps parent credentials."""
         mock_cfg.return_value = {
-            "max_iterations": 45,
+            "max_iterations": 50,
             "model": "google/gemini-3-flash-preview",
             "provider": "",
         }

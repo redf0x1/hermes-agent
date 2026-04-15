@@ -9435,6 +9435,36 @@ class AIAgent:
                         FailoverReason.rate_limit,
                         FailoverReason.billing,
                     )
+                    is_usage_limit_reached = (
+                        is_rate_limited and self._is_usage_limit_reached(error_context)
+                    )
+                    if is_usage_limit_reached and not recovered_with_pool:
+                        _reset_hint = self._format_reset_hint(error_context)
+                        if self._fallback_index < len(self._fallback_chain):
+                            self._emit_status(
+                                f"⚠️ Usage limit reached{_reset_hint} — switching to fallback provider..."
+                            )
+                            if self._try_activate_fallback():
+                                retry_count = 0
+                                compression_attempts = 0
+                                primary_recovery_attempted = False
+                                continue
+
+                        _usage_msg = (
+                            f"Usage limit reached{_reset_hint}. "
+                            "No alternate credential/provider is currently available."
+                        )
+                        self._emit_status(f"❌ {_usage_msg}")
+                        self._persist_session(messages, conversation_history)
+                        return {
+                            "final_response": _usage_msg,
+                            "messages": messages,
+                            "api_calls": api_call_count,
+                            "completed": False,
+                            "failed": True,
+                            "error": _usage_msg,
+                        }
+
                     if is_rate_limited and self._fallback_index < len(self._fallback_chain):
                         # Don't eagerly fallback if credential pool rotation may
                         # still recover.  The pool's retry-then-rotate cycle needs
@@ -9449,26 +9479,6 @@ class AIAgent:
                                 compression_attempts = 0
                                 primary_recovery_attempted = False
                                 continue
-
-                    if is_rate_limited and self._is_usage_limit_reached(error_context):
-                        pool = self._credential_pool
-                        pool_may_recover = pool is not None and pool.has_available()
-                        if not pool_may_recover:
-                            _reset_hint = self._format_reset_hint(error_context)
-                            _usage_msg = (
-                                f"Usage limit reached{_reset_hint}. "
-                                "No alternate credential/provider is currently available."
-                            )
-                            self._emit_status(f"❌ {_usage_msg}")
-                            self._persist_session(messages, conversation_history)
-                            return {
-                                "final_response": _usage_msg,
-                                "messages": messages,
-                                "api_calls": api_call_count,
-                                "completed": False,
-                                "failed": True,
-                                "error": _usage_msg,
-                            }
 
                     is_payload_too_large = (
                         classified.reason == FailoverReason.payload_too_large
